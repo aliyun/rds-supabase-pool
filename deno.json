@@ -1,0 +1,12 @@
+{
+  "lock": true,
+  "fmt": {
+    "lineWidth": 120,
+    "exclude": ["frontend", "node_modules"]
+  },
+  "lint": {
+    "rules": {
+      "exclude": ["no-explicit-any"]
+    }
+  }
+}

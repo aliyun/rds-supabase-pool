@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage/
+
+# 本地运行数据：设置、凭证、Mock 状态、日志
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials*.json
+
+# 前端
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/vite.config.js
+frontend/vite.config.d.ts
+*.tsbuildinfo
+
+# 系统与编辑器
+.DS_Store
+.idea/
+.vscode/
+*.log
+*.zip
+
+# Edge 构建产物
+edge/.build/
+
+# Edge 首次部署生成的本地凭证
+edge/.bootstrap.env
