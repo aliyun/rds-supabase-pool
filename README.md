@@ -47,7 +47,7 @@ flowchart LR
 
 - 一台已开启 **Agent Runtime** 的 RDS Supabase 控制面实例；
 - 可访问的 HTTPS 域名（`*-pb.*.apsaradb.com` 或等价域名）；
-- Python 3.9+、Node.js 20.19+、npm、curl、bash；
+- Python 3.9+、Node.js 20.19+、npm、curl、bash（Node/npm 仅源码构建 UI 时需要；使用 Release 产物时不需要）；
 - 阿里云 RAM AK/SK，权限要求见 [docs/deployment.md](docs/deployment.md)。
 
 控制面实例由部署者自行创建，脚本不创建控制面实例。
@@ -55,6 +55,9 @@ flowchart LR
 ### 部署（默认 Mock）
 
 ```bash
+export DEPLOY_UI="release"
+export POOL_UI_RELEASE_TAG="v0.1.0"
+
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<8~32 位，至少包含大写/小写/数字/特殊字符中的三类>"
 export ALIBABA_CLOUD_ACCESS_KEY_ID="<RAM 用户 AK>"
@@ -64,6 +67,10 @@ export CLOUD_MODE="mock"
 
 ./edge/bootstrap.sh
 ```
+
+> Release 模式需要对应 GitHub Release 已上传 `pool-ui-v0.1.0.ts` 和 `.sha256`。
+> 开发或尚未发布 Release 时，使用源码构建：`DEPLOY_UI=source ./edge/bootstrap.sh`（需要 Node/npm）。
+> 只更新 API：`DEPLOY_UI=0 ./edge/bootstrap.sh`。
 
 脚本会自动：
 

@@ -46,10 +46,13 @@ Prerequisites:
 
 - An existing RDS Supabase control-plane instance with Agent Runtime enabled.
 - An HTTPS domain or reachable instance endpoint.
-- Python 3.9+, Node.js 20.19+, npm, curl, bash.
+- Python 3.9+, Node.js 20.19+, npm, curl, bash (Node/npm are only required for source UI builds; not required when using a release artifact).
 - Alibaba Cloud RAM AK/SK with the permissions in [docs/deployment.md](docs/deployment.md).
 
 ```bash
+export DEPLOY_UI="release"
+export POOL_UI_RELEASE_TAG="v0.1.0"
+
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<strong-password>"
 export ALIBABA_CLOUD_ACCESS_KEY_ID="<ram-access-key-id>"
@@ -59,6 +62,10 @@ export CLOUD_MODE="mock"
 
 ./edge/bootstrap.sh
 ```
+
+> Release mode requires `pool-ui-v0.1.0.ts` and its `.sha256` to be uploaded to the corresponding GitHub Release.
+> For development or before a release exists, use `DEPLOY_UI=source ./edge/bootstrap.sh` (requires Node/npm).
+> To update the API only, use `DEPLOY_UI=0 ./edge/bootstrap.sh`.
 
 The script resolves the instance endpoint and service key, creates
 `pool_admin` / `pool_control`, writes Edge Secrets, deploys `pool-api` and

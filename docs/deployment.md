@@ -170,9 +170,12 @@ export AUTO_WHITELIST=false
 
 ## 6. 一条命令部署
 
-全部通过环境变量传入。推荐只设置这 5 个：
+全部通过环境变量传入。推荐设置：
 
 ```bash
+export DEPLOY_UI="release"
+export POOL_UI_RELEASE_TAG="v0.1.0"
+
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<8~32 位，至少含大写/小写/数字/特殊字符中的三类>"
 export ALIBABA_CLOUD_ACCESS_KEY_ID="<RAM 用户 AK>"
@@ -184,6 +187,30 @@ export CLOUD_MODE="mock"
 ```
 
 `bootstrap.sh` 默认使用 `mock`，不会创建 PG / Supabase 业务实例。确认使用测试账号并接受费用风险后，再显式设置 `CLOUD_MODE=real`；真实模式会创建计费资源。
+
+### UI 部署模式
+
+客户部署默认使用 Release 产物，无需安装 Node/npm；前提是对应 GitHub Release 已上传 `pool-ui-v0.1.0.ts` 和 `.sha256`。脚本会下载并校验 SHA256，校验失败会中止。
+
+源码开发或发版时使用 `DEPLOY_UI=source`（脚本默认值，需要 Node 20.19+）：
+
+```bash
+DEPLOY_UI=source ./edge/bootstrap.sh
+```
+
+只更新 API、不处理 UI：
+
+```bash
+DEPLOY_UI=0 ./edge/bootstrap.sh
+```
+
+构建 Release 产物：
+
+```bash
+./scripts/build-ui-release.sh v0.1.0
+```
+
+生成 `edge/.build/release/pool-ui-v0.1.0.ts` 和 `.sha256`，上传到对应 GitHub Release 即可。可用 `POOL_UI_RELEASE_REPO`、`POOL_UI_RELEASE_URL` 覆盖默认下载地址。
 
 脚本会调用 RdsAi/RDS API 自动解析：
 
@@ -197,11 +224,11 @@ export CLOUD_MODE="mock"
 
 脚本会自动完成：
 
-0. 首次构建 UI 时执行 `npm ci` 安装前端依赖
+0. 源码模式首次构建 UI 时执行 `npm ci` 安装前端依赖
 1. 生成并写入 Edge Secrets（JWT 密钥、worker token、Supabase 应用密码等）。
 2. 部署 `pool-api`。
 3. 安装 `pg_cron` / `pg_net`，并按每分钟调度 worker。
-4. 构建并部署 `pool-ui`。
+4. 按 `DEPLOY_UI` 部署 `pool-ui`（源码构建或 Release 产物）。
 5. 执行健康检查。
 
 首次部署会把 worker token、实例地址和 service key 保存到 `edge/.bootstrap.env`（权限 0600，已加入 .gitignore），用于后续重新部署；请备份并妥善保管。
