@@ -1757,13 +1757,14 @@ async function overviewPayload(requestedRegionId = "") {
   const stored = (await configGet("settings")) || {};
   const selectedRegionId = requestedRegionId || stored.region_id || regions[0]?.region_id || "";
   const region = regions.find((item: any) => item.region_id === selectedRegionId) || regions[0] || null;
+  const regionPools = region?.pools || [];
   const instances = region
     ? await sql`select count(*)::int as total from pool_instances where is_deleted = false and region_id = ${region.region_id}`
     : await sql`select count(*)::int as total from pool_instances where is_deleted = false`;
   const tasks = region
     ? await sql`select t.* from tasks t left join pools p on p.id = t.pool_id where p.region_id = ${region.region_id} or t.pool_id is null order by t.created_at desc limit 8`
     : await sql`select * from tasks order by created_at desc limit 8`;
-  const firstPool = region?.pools?.[0];
+  const firstPool = regionPools[0];
   const shared = await sharedPgRows(undefined, region?.region_id);
   const capacityCached = aggregateCapacity(shared);
   const failedTasks = region
@@ -1815,7 +1816,23 @@ async function overviewPayload(requestedRegionId = "") {
     region: region || null,
     region_id: region?.region_id || "",
     instance_total: instances[0].total,
-    pools: Object.fromEntries((region?.pools || []).map((pool: any) => [pool.mode, pool])),
+    pools: Object.fromEntries(
+      (["single", "shared"] as const).map((mode) => [
+        mode,
+        regionPools.find((pool: any) => pool.mode === mode) || {
+          mode,
+          target: 0,
+          max: 0,
+          total: 0,
+          by_status: {},
+          cold: 0,
+          reserved: 0,
+          in_use: 0,
+          creating: 0,
+          failed: 0,
+        },
+      ]),
+    ),
     shared_pgs: shared,
     capacity_cached: capacityCached,
     recent_tasks: tasks.map(taskPayload),
@@ -3714,7 +3731,7 @@ async function handler(req: Request): Promise<Response> {
         return json({ available: true, month, region_id: regionId, currency: "CNY", total_pretax: 0, total_payment: 0, payg_total: 0, subscription_total: 0, pg_count: entries.size, items: [...entries.values()].map((item) => ({ ...item, pretax_amount: 0, payment_amount: 0, payg_amount: 0, subscription_amount: 0, storage_amount: 0, compute_amount: 0, other_amount: 0, billing_type: "none", found: false, currency: "CNY", spec: "", region: "" })), errors: [], fetched_at: new Date().toISOString() });
       }
       try {
-        const adapter = new RealAdapter(regionId || (await regionsPayload())[0]?.region_id || "cn-chengdu");
+        const adapter = new RealAdapter(regionId || (await regionsPayload())[0]?.region_id || defaultRegionId());
         const billItems: any[] = [];
         let token = "";
         for (let page = 0; page < 5; page += 1) {

@@ -828,7 +828,7 @@ export function SettingsPage() {
           <SectionTitle icon={<AlertTriangle size={15} />} title="安全边界" subtitle="真实模式请谨慎操作" />
           <ul className="mt-3 space-y-2 text-[11px] leading-6 text-slate-400">
             <li>· 所有创建、销毁操作都需要在页面二次确认；自动补货默认关闭。</li>
-            <li>· AK/SK 仅保存在本机 0600 文件，不进入数据库，页面只展示脱敏值。</li>
+            <li>· AK/SK 仅保存在 Edge Secrets，不进入数据库，页面只展示脱敏值。</li>
             <li>· 删除单租户实例会同时删除底层 PG；多租共享池只删除当前租户。</li>
             <li>· 普通停不会释放连接名额；需要降低活跃租户数时请使用 Force 停。</li>
             <li>· 真实模式会产生费用，建议先用 Mock 模式跑通页面与流程。</li>

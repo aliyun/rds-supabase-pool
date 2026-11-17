@@ -234,7 +234,7 @@ export interface Overview {
   alerts: Alert[];
   region?: Region | null;
   region_id?: string;
-  pools: Record<PoolMode, PoolSummary>;
+  pools: Partial<Record<PoolMode, PoolSummary>>;
   shared_pgs?: SharedPg[];
   capacity_cached?: Capacity;
   recent_tasks: TaskRecord[];

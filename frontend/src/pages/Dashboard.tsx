@@ -33,13 +33,15 @@ export function DashboardPage() {
   const [selfhealLoading, setSelfhealLoading] = useState(false);
 
   const total = overview?.instance_total ?? 0;
-  const cold = (overview?.pools.single.cold ?? 0) + (overview?.pools.shared.cold ?? 0);
-  const inUse = (overview?.pools.single.in_use ?? 0) + (overview?.pools.shared.in_use ?? 0);
-  const failed = (overview?.pools.single.failed ?? 0) + (overview?.pools.shared.failed ?? 0);
-  const target = (overview?.pools.single.target ?? 0) + (overview?.pools.shared.target ?? 0);
+  const singlePool = overview?.pools?.single;
+  const sharedPool = overview?.pools?.shared;
+  const cold = (singlePool?.cold ?? 0) + (sharedPool?.cold ?? 0);
+  const inUse = (singlePool?.in_use ?? 0) + (sharedPool?.in_use ?? 0);
+  const failed = (singlePool?.failed ?? 0) + (sharedPool?.failed ?? 0);
+  const target = (singlePool?.target ?? 0) + (sharedPool?.target ?? 0);
   const capacity = overview?.capacity_cached;
   const sharedPgs = overview?.shared_pgs ?? [];
-  const sharedPoolReady = Boolean(overview?.pools.shared.id);
+  const sharedPoolReady = Boolean(sharedPool?.id);
 
   const chartData = useMemo(() => {
     const kinds = meta?.task_kinds ?? [];
@@ -111,7 +113,7 @@ export function DashboardPage() {
         <StatCard
           label="实例总量"
           value={formatNumber(total)}
-          sub={`单租 ${overview?.pools.single.total ?? 0} · 多租 ${overview?.pools.shared.total ?? 0}`}
+          sub={`单租 ${singlePool?.total ?? 0} · 多租 ${sharedPool?.total ?? 0}`}
           icon={<Layers size={16} />}
           tone="cyan"
           delay="0ms"
@@ -144,7 +146,7 @@ export function DashboardPage() {
 
       <div className="grid gap-4 xl:grid-cols-2">
         {(["single", "shared"] as PoolMode[]).map((mode, index) => {
-          const pool = overview?.pools[mode];
+          const pool = overview?.pools?.[mode];
           const modeMeta = MODE_META[mode];
           const percentage = pool && pool.target > 0 ? Math.round((pool.cold / pool.target) * 100) : 0;
           return (

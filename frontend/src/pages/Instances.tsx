@@ -104,11 +104,11 @@ export function InstancesPage() {
             <div className="flex flex-wrap items-center gap-2">
               <div className="hidden items-center gap-2 rounded-lg border border-edge bg-white/[0.02] px-2.5 py-1.5 text-[10px] text-slate-500 sm:flex">
                 <span>
-                  冷池 <span className="mono text-sky-300">{overview?.pools.single.cold ?? 0}</span>
+                  冷池 <span className="mono text-sky-300">{overview?.pools?.single?.cold ?? 0}</span>
                 </span>
                 <span className="h-3 w-px bg-edge" />
                 <span>
-                  使用中 <span className="mono text-acid">{overview?.pools.single.in_use ?? 0}</span>
+                  使用中 <span className="mono text-acid">{overview?.pools?.single?.in_use ?? 0}</span>
                 </span>
               </div>
               <Button

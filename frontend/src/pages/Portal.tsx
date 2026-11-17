@@ -132,7 +132,12 @@ export function PortalApp() {
             <Button variant="secondary" icon={<KeyRound size={14} />} onClick={() => setTokensOpen(true)}>
               API Token
             </Button>
-            <Button variant="primary" icon={<Plus size={14} />} onClick={() => openApply()}>
+            <Button
+              variant="primary"
+              icon={<Plus size={14} />}
+              disabled={!regions.length}
+              onClick={() => openApply()}
+            >
               申请实例
             </Button>
           </div>
