@@ -2205,6 +2205,24 @@ async function sharedPgRows(poolId?: string, regionId?: string) {
   return rows.map((row: any) => sharedPgView({ ...row, tenant_count: byId.get(row.pg_instance_id) || 0 }));
 }
 
+function normalizeCapacityPayload(value: any, fallbackName = "") {
+  const data = parseObject(value);
+  const number = (input: unknown) => {
+    const parsed = Number(input);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  const activeRatio = Number(data.active_ratio);
+  return {
+    db_instance_name: String(data.db_instance_name || fallbackName || ""),
+    active_ratio: Number.isFinite(activeRatio) && activeRatio > 0 ? activeRatio : 0.5,
+    estimated_max_active_tenants: number(data.estimated_max_active_tenants),
+    estimated_max_total_tenants: number(data.estimated_max_total_tenants),
+    current_active_tenants: number(data.current_active_tenants),
+    current_total_tenants: number(data.current_total_tenants),
+    message: String(data.message || ""),
+  };
+}
+
 function aggregateCapacity(rows: any[]) {
   if (!rows.length) return {};
   const sum = (key: string) => rows.reduce((total, row) => total + Number(row.capacity?.[key] || 0), 0);
@@ -3592,14 +3610,14 @@ async function handler(req: Request): Promise<Response> {
       const row: any = rows[0];
       const adapter = cloudAdapter(CLOUD_MODE, row?.region_id || url.searchParams.get("region_id") || defaultRegionId());
       try {
-        const capacity = await adapter.getCapacity(pgId);
+        const capacity = normalizeCapacityPayload(await adapter.getCapacity(pgId), pgId);
         if (row) {
           await sql`update shared_pgs set capacity = ${JSON.stringify(capacity)}::json, last_checked_at = now() where pg_instance_id = ${pgId}`;
         }
         return json({ pg_id: pgId, region_id: row?.region_id || "", pool_id: row?.pool_id || null, mode: adapter.mode, capacity, capacity_error: null, stale: false });
       } catch (err) {
         const cached = parseObject(row?.capacity);
-        const capacity = Object.keys(cached).length ? cached : null;
+        const capacity = Object.keys(cached).length ? normalizeCapacityPayload(cached, pgId) : null;
         return json({
           pg_id: pgId,
           region_id: row?.region_id || "",
@@ -3622,7 +3640,7 @@ async function handler(req: Request): Promise<Response> {
       const row: any = rows[0];
       const adapter = cloudAdapter(CLOUD_MODE, row?.region_id || url.searchParams.get("region_id") || defaultRegionId());
       try {
-        const capacity = await adapter.modifyCapacity(pgId, ratio);
+        const capacity = normalizeCapacityPayload(await adapter.modifyCapacity(pgId, ratio), pgId);
         if (row) {
           await sql`update shared_pgs set capacity = ${JSON.stringify(capacity)}::json, last_checked_at = now() where pg_instance_id = ${pgId}`;
         }

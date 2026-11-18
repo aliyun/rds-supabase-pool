@@ -21,6 +21,25 @@ import type { Capacity, SharedPg } from "../lib/types";
 
 const PRESETS = [0.1, 0.25, 0.5, 0.75, 1];
 
+function normalizeCapacity(value?: Capacity | null): Capacity | null {
+  if (!value) return null;
+  const activeRatio = Number(value.active_ratio);
+  const number = (input: unknown) => {
+    const parsed = Number(input);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  return {
+    ...value,
+    db_instance_name: value.db_instance_name || "",
+    active_ratio: Number.isFinite(activeRatio) && activeRatio > 0 ? activeRatio : 0.5,
+    estimated_max_active_tenants: number(value.estimated_max_active_tenants),
+    estimated_max_total_tenants: number(value.estimated_max_total_tenants),
+    current_active_tenants: number(value.current_active_tenants),
+    current_total_tenants: number(value.current_total_tenants),
+    message: value.message || "",
+  };
+}
+
 export function CapacityPage() {
   const { region, regionId, refreshOverview } = useAppData();
   const { push } = useToast();
@@ -43,8 +62,9 @@ export function CapacityPage() {
   const stopMode = region?.pools.find((item) => item.mode === "shared")?.config.stop_mode;
 
   const applyDetail = (data: { capacity: Capacity | null; capacity_error?: string | null; stale?: boolean }) => {
-    setCapacity(data.capacity);
-    if (data.capacity) setRatio(data.capacity.active_ratio);
+    const next = normalizeCapacity(data.capacity);
+    setCapacity(next);
+    if (next) setRatio(next.active_ratio);
     setNotice(
       data.capacity_error ? `${data.capacity_error}${data.stale ? " 当前展示上次缓存的容量快照。" : ""}` : null,
     );
@@ -110,8 +130,9 @@ export function CapacityPage() {
     setSaving(true);
     try {
       const result = await api.modifyCapacity(Number(ratio.toFixed(2)), selectedId);
-      setCapacity(result.capacity);
-      setRatio(result.capacity.active_ratio);
+      const next = normalizeCapacity(result.capacity);
+      setCapacity(next);
+      if (next) setRatio(next.active_ratio);
       setNotice(null);
       setDirty(false);
       push("success", result.message || "activeRatio 已更新");
