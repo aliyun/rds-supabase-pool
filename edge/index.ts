@@ -1039,6 +1039,110 @@ async function ensureWorkerSchema() {
   workerSchemaReady = true;
 }
 
+let monitorSchemaReady = false;
+async function ensureMonitorSchema() {
+  if (monitorSchemaReady) return;
+  const db = await adminDb();
+  try {
+    await db`create table if not exists public.function_heartbeat (
+      component text primary key,
+      last_seen_at timestamptz not null default now(),
+      last_success_at timestamptz,
+      last_error_at timestamptz,
+      last_error text,
+      version text,
+      meta jsonb not null default '{}'::jsonb
+    )`;
+    await db`create table if not exists public.alert_outbox (
+      id bigserial primary key,
+      component text not null,
+      status text not null,
+      message text not null,
+      detail jsonb not null default '{}'::jsonb,
+      attempts integer not null default 0,
+      last_error text,
+      created_at timestamptz not null default now(),
+      sent_at timestamptz
+    )`;
+    await db`create table if not exists public.monitor_state (
+      component text primary key,
+      state text not null default 'healthy',
+      last_alert_at timestamptz,
+      last_alert_status text
+    )`;
+    await db`create table if not exists public.monitor_config (
+      key text primary key,
+      value text not null,
+      updated_at timestamptz not null default now()
+    )`;
+    await db`
+      insert into public.function_heartbeat (component, last_seen_at)
+      values ('pool-api', now()), ('pool-worker', now())
+      on conflict (component) do nothing
+    `;
+    monitorSchemaReady = true;
+  } finally {
+    await db.end({ timeout: 3 });
+  }
+}
+
+const HEARTBEAT_VERSION = Deno.env.get("POOL_BUILD_VERSION") || "unknown";
+let lastHeartbeatAt = 0;
+let heartbeatWriteInFlight = false;
+
+async function writeHeartbeat(
+  component: string,
+  success: boolean,
+  errorMessage = "",
+  meta: Record<string, any> = {},
+) {
+  let db: any;
+  try {
+    db = await adminDb();
+    await db`
+      insert into public.function_heartbeat
+        (component, last_seen_at, last_success_at, last_error_at, last_error, version, meta)
+      values
+        (${component}, now(), ${success ? new Date() : null}, ${success ? null : new Date()},
+         ${success ? null : errorMessage}, ${HEARTBEAT_VERSION}, ${JSON.stringify(meta)}::jsonb)
+      on conflict (component) do update set
+        last_seen_at = now(),
+        last_success_at = case when ${success} then now() else function_heartbeat.last_success_at end,
+        last_error_at = case when ${success} then function_heartbeat.last_error_at else now() end,
+        last_error = case when ${success} then function_heartbeat.last_error else ${errorMessage} end,
+        version = ${HEARTBEAT_VERSION},
+        meta = ${JSON.stringify(meta)}::jsonb
+    `;
+  } catch (err) {
+    console.error("heartbeat write failed", String(err));
+  } finally {
+    if (db) {
+      try {
+        await db.end({ timeout: 2 });
+      } catch {
+        // ignore connection shutdown errors
+      }
+    }
+    heartbeatWriteInFlight = false;
+  }
+}
+
+function recordHeartbeat(
+  component: string,
+  success: boolean,
+  errorMessage = "",
+  meta: Record<string, any> = {},
+) {
+  const now = Date.now();
+  if (success && (heartbeatWriteInFlight || now - lastHeartbeatAt < 30_000)) return;
+  if (success) lastHeartbeatAt = now;
+  heartbeatWriteInFlight = true;
+  const run = writeHeartbeat(component, success, errorMessage, meta);
+  const runtime = (globalThis as any).EdgeRuntime;
+  if (runtime?.waitUntil) runtime.waitUntil(run);
+  else void run;
+}
+
 const BASE_SCHEMA_STATEMENTS = [
     `create table if not exists regions (
       region_id varchar(40) primary key,
@@ -1366,6 +1470,11 @@ async function initControlPlane(force = false) {
   await ensureBaseSchema();
   await loadRuntimeConfig();
   await ensureWorkerSchema();
+  try {
+    await ensureMonitorSchema();
+  } catch (err) {
+    console.error("monitor schema init failed", String(err));
+  }
 }
 
 async function setControlDbPointer(targetUrl: string) {
@@ -2764,6 +2873,7 @@ async function handler(req: Request): Promise<Response> {
       if (!(await maybeSelfWhitelistControlDb(initErr))) throw initErr;
       await initControlPlane(true);
     }
+    recordHeartbeat("pool-api", true);
     if (!path.startsWith("/api/internal/")) kickWorkerChain();
     if (path === "/health" || path === "/api/health") {
       const rows = await sql`select count(*)::int as users from platform_users`;
@@ -3052,10 +3162,104 @@ async function handler(req: Request): Promise<Response> {
         const escapedHeaders = headers.replace(/'/g, "''");
         const command = `select net.http_post(url := '${escapedUrl}', headers := '${escapedHeaders}'::jsonb, body := '{}'::jsonb, timeout_milliseconds := 60000)`;
         await db`select cron.schedule('pool-worker-tick', '* * * * *', ${command})`;
-        const jobs = await db`select jobid, jobname, schedule, active from cron.job where jobname = 'pool-worker-tick'`;
+        const notifierUrl = tickUrl.includes("/functions/v1/pool-api/api/internal/worker/tick")
+          ? tickUrl.replace("/functions/v1/pool-api/api/internal/worker/tick", "/functions/v1/pool-notifier")
+          : `${reqUrl.origin}/functions/v1/pool-notifier`;
+        const notificationsEnabled = Boolean(Deno.env.get("DINGTALK_WEBHOOK"));
+        await db`create table if not exists public.monitor_config (
+          key text primary key,
+          value text not null,
+          updated_at timestamptz not null default now()
+        )`;
+        await db`
+          insert into public.monitor_config (key, value, updated_at)
+          values ('notifications_enabled', ${notificationsEnabled ? "true" : "false"}, now())
+          on conflict (key) do update set value = excluded.value, updated_at = now()
+        `;
+        await db.unsafe(`
+          create or replace function public.pool_health_watchdog(p_notifier_url text, p_worker_token text)
+          returns void
+          language plpgsql
+          security definer
+          as $fn$
+          declare
+            h record;
+            prev_state text;
+            notifier_enabled text;
+          begin
+            insert into public.function_heartbeat (component, last_seen_at)
+            values ('pool-api', now()), ('pool-worker', now())
+            on conflict (component) do nothing;
+
+            for h in
+              select component, last_seen_at, last_error
+              from public.function_heartbeat
+              where component in ('pool-api', 'pool-worker')
+            loop
+              insert into public.monitor_state (component, state)
+              values (h.component, 'healthy')
+              on conflict (component) do nothing;
+
+              select state into prev_state
+              from public.monitor_state
+              where component = h.component;
+
+              if h.last_seen_at < now() - interval '3 minutes' then
+                if prev_state is distinct from 'unhealthy' then
+                  insert into public.alert_outbox (component, status, message, detail)
+                  values (
+                    h.component,
+                    'unhealthy',
+                    h.component || ' 心跳超过 3 分钟',
+                    jsonb_build_object('last_seen_at', h.last_seen_at, 'last_error', h.last_error)
+                  );
+                  update public.monitor_state
+                  set state = 'unhealthy', last_alert_at = now(), last_alert_status = 'unhealthy'
+                  where component = h.component;
+                end if;
+              else
+                if prev_state = 'unhealthy' then
+                  insert into public.alert_outbox (component, status, message, detail)
+                  values (
+                    h.component,
+                    'recovered',
+                    h.component || ' 心跳已恢复',
+                    jsonb_build_object('last_seen_at', h.last_seen_at)
+                  );
+                  update public.monitor_state
+                  set state = 'healthy', last_alert_at = now(), last_alert_status = 'recovered'
+                  where component = h.component;
+                end if;
+              end if;
+            end loop;
+
+            select value into notifier_enabled
+            from public.monitor_config
+            where key = 'notifications_enabled';
+
+            if coalesce(notifier_enabled, 'false') = 'true'
+              and exists (select 1 from public.alert_outbox where sent_at is null) then
+              perform net.http_post(
+                url := p_notifier_url,
+                headers := jsonb_build_object(
+                  'Content-Type', 'application/json',
+                  'X-Worker-Token', p_worker_token
+                ),
+                body := '{}'::jsonb,
+                timeout_milliseconds := 10000
+              );
+            end if;
+          end;
+          $fn$;
+        `);
+        await db`select cron.unschedule(jobid) from cron.job where jobname = 'pool-health-watchdog'`;
+        const watchdogCommand = `select public.pool_health_watchdog('${escapeLiteral(notifierUrl)}', '${escapeLiteral(expected)}')`;
+        await db`select cron.schedule('pool-health-watchdog', '* * * * *', ${watchdogCommand})`;
+        const jobs = await db`select jobid, jobname, schedule, active from cron.job where jobname in ('pool-worker-tick', 'pool-health-watchdog')`;
         return json({
           ok: !!working,
           tick_url: tickUrl,
+          notifier_url: notifierUrl,
           public_url: working?.store ? working.base : storedPublicUrl,
           request: {
             url: req.url,
@@ -3067,7 +3271,9 @@ async function handler(req: Request): Promise<Response> {
             env_public_url: Deno.env.get("SUPABASE_PUBLIC_URL") || "",
           },
           egress_tests: tests,
-          job: jobs[0] || null,
+          notifications_enabled: notificationsEnabled,
+          job: jobs.find((job: any) => job.jobname === "pool-worker-tick") || null,
+          watchdog_job: jobs.find((job: any) => job.jobname === "pool-health-watchdog") || null,
           message: working ? "worker 调度已启用" : "pg_cron 已配置，但 pg_net 出口测试未通过",
         });
       } catch (err) {
@@ -3083,11 +3289,12 @@ async function handler(req: Request): Promise<Response> {
       if (req.headers.get("x-worker-token") !== expected) return error("worker token 无效", 401);
       const db = await adminDb();
       try {
-        const jobs = await db`select jobid, jobname, schedule, active from cron.job where jobname = 'pool-worker-tick'`;
+        const jobs = await db`select jobid, jobname, schedule, active from cron.job where jobname in ('pool-worker-tick', 'pool-health-watchdog')`;
         let runs: any[] = [];
         let responses: any[] = [];
+        let heartbeat: any[] = [];
         try {
-          runs = await db`select jobid, runid, status, return_message, start_time, end_time from cron.job_run_details where jobid in (select jobid from cron.job where jobname = 'pool-worker-tick') order by start_time desc limit 8`;
+          runs = await db`select jobid, runid, status, return_message, start_time, end_time from cron.job_run_details where jobid in (select jobid from cron.job where jobname in ('pool-worker-tick', 'pool-health-watchdog')) order by start_time desc limit 12`;
         } catch (err) {
           runs = [{ error: String(err) }];
         }
@@ -3096,7 +3303,12 @@ async function handler(req: Request): Promise<Response> {
         } catch (err) {
           responses = [{ error: String(err) }];
         }
-        return json({ jobs, runs, responses, pending: (await sql`select count(*)::int as total from tasks where status in ('pending', 'running')`)[0]?.total || 0, tasks: await sql`select id, kind, status, step, attempts, message, created_at, started_at, finished_at from tasks order by created_at desc limit 6` });
+        try {
+          heartbeat = await db`select component, last_seen_at, last_success_at, last_error_at, last_error, version, meta from public.function_heartbeat order by component`;
+        } catch (err) {
+          heartbeat = [{ error: String(err) }];
+        }
+        return json({ jobs, runs, responses, heartbeat, pending: (await sql`select count(*)::int as total from tasks where status in ('pending', 'running')`)[0]?.total || 0, tasks: await sql`select id, kind, status, step, attempts, message, created_at, started_at, finished_at from tasks order by created_at desc limit 6` });
       } catch (err) {
         return error(`调度状态读取失败: ${String(err)}`, 500);
       } finally {
@@ -3109,7 +3321,9 @@ async function handler(req: Request): Promise<Response> {
       if (!expected) return error("WORKER_TOKEN 未配置", 503);
       if (req.headers.get("x-worker-token") !== expected) return error("worker token 无效", 401);
       if (url.searchParams.get("dry") === "1") return json({ ok: true, dry: true });
-      return json(await drainWorker(25000));
+      const result = await drainWorker(25000);
+      await writeHeartbeat("pool-worker", true, "", { processed: Number(result?.processed || 0) });
+      return json(result);
     }
 
     if (path === "/api/instances/prewarm" && method === "POST") {
@@ -4215,6 +4429,7 @@ async function handler(req: Request): Promise<Response> {
 
     return error("Not found", 404);
   } catch (err) {
+    recordHeartbeat("pool-api", false, String(err));
     console.error(err);
     return error(String(err), 500);
   }

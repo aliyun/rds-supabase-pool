@@ -27,6 +27,39 @@ fi
 : "${WORKER_TOKEN:?请设置 WORKER_TOKEN}"
 BASE="${SUPABASE_URL%/}"
 
+if [ -n "${DINGTALK_WEBHOOK:-}" ]; then
+  echo "==> DingTalk alert secrets"
+  DINGTALK_SECRETS=$(python3 -c '
+import json, os
+payload = [{"name": "DINGTALK_WEBHOOK", "value": os.environ["DINGTALK_WEBHOOK"]}]
+if os.environ.get("DINGTALK_SECRET"):
+    payload.append({"name": "DINGTALK_SECRET", "value": os.environ["DINGTALK_SECRET"]})
+print(json.dumps(payload))
+')
+  RESPONSE_FILE="$(mktemp)"
+  trap 'rm -f "$RESPONSE_FILE"' EXIT
+  HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' -m 120 \
+    -X POST "$BASE/secrets/v1" \
+    -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+    -H 'Content-Type: application/json' \
+    --data-binary "$DINGTALK_SECRETS")
+  if [ "${HTTP_CODE:0:1}" != "2" ]; then
+    HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' -m 120 \
+      -X PUT "$BASE/secrets/v1" \
+      -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+      -H 'Content-Type: application/json' \
+      --data-binary "$DINGTALK_SECRETS")
+  fi
+  if [ "${HTTP_CODE:0:1}" != "2" ]; then
+    echo "DingTalk Secret 写入失败（HTTP $HTTP_CODE）：" >&2
+    cat "$RESPONSE_FILE" >&2
+    exit 1
+  fi
+  rm -f "$RESPONSE_FILE"
+  trap - EXIT
+  echo "DingTalk webhook 已更新"
+fi
+
 UI_MODE="${DEPLOY_UI:-0}"
 case "$UI_MODE" in
   1|source) UI_MODE=source ;;
@@ -50,6 +83,9 @@ deploy() {
 
 echo "==> pool-api"
 deploy pool-api "$ROOT/edge/index.ts"
+
+echo "==> pool-notifier"
+deploy pool-notifier "$ROOT/edge/notifier.ts"
 
 echo "==> scheduler"
 curl -fsS -m 120 -X POST "$BASE/functions/v1/pool-api/api/internal/scheduler/setup" \

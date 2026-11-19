@@ -65,6 +65,10 @@ export ALIBABA_CLOUD_ACCESS_KEY_SECRET="<RAM 用户 SK>"
 export REGION="cn-hangzhou"
 export CLOUD_MODE="mock"
 
+# Optional: enable DingTalk alerts. Leave unset to keep alerts internal only.
+export DINGTALK_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=..."
+export DINGTALK_SECRET="SEC..."   # required only for a signed robot
+
 ./edge/bootstrap.sh
 ```
 
@@ -107,6 +111,24 @@ export CLOUD_MODE="real"
 4. 共享池添加 Running 的 PG，或对单租户池执行预热；
 5. 在「平台账号」创建使用者账号。
 
+## 已有实例升级 / 服务异常恢复
+
+已有实例无需重新执行 `bootstrap.sh`，直接执行：
+
+```bash
+./edge/upgrade.sh
+```
+
+脚本会自动读取首次部署生成的 `edge/.bootstrap.env`，更新 `pool-api`、`pool-ui`、`pool-notifier` 和 watchdog，并执行健康检查。
+
+如果只是新增或更换钉钉告警：
+
+```bash
+DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
+```
+
+如果 `edge/.bootstrap.env` 丢失，需要先按部署文档恢复部署配置。不要用 `bootstrap.sh` 做已有实例的升级或恢复。
+
 ## 使用者 API 与 CLI
 
 使用者在门户创建 PAT 后，可通过 CLI 申请、查询和归还实例：
@@ -121,6 +143,25 @@ poolctl release my-app --yes --wait
 ```
 
 Token 只能访问 `/api/v1/portal/*`，不能访问管理端、成本、任务日志或云凭证。详见 [docs/api.md](docs/api.md)。
+
+## 监控与告警
+
+控制面会为 `pool-api` 的 API 请求层和后台 worker 链路维护 heartbeat。`supabase_db` 中的 `pg_cron` watchdog 会在心跳超时后写入 `alert_outbox`，由独立的 `pool-notifier` 发送钉钉告警和恢复通知。
+
+- **`DINGTALK_WEBHOOK` 是外部告警开关**：设置后启用钉钉投递；未设置时 heartbeat、watchdog 和 outbox 仍工作，但不会调用 notifier，也不会影响主业务。
+- `DINGTALK_SECRET` 仅在钉钉机器人使用「加签」时需要；使用自定义关键词时可以不配置。
+- 首次部署时把这两个变量传给 `bootstrap.sh`，脚本会写入 Edge Secrets。
+- 已有实例重新部署使用 `./edge/upgrade.sh`；它会更新 `pool-api` / `pool-ui` / `pool-notifier` 并重挂 watchdog。默认不会修改 Edge Secrets；如需新增或更换 webhook，可执行：
+
+```bash
+DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
+```
+
+只有显式提供 `DINGTALK_WEBHOOK` 时才会更新相关 Secret，未提供时保留现有配置。
+- 未配置 webhook 时不会因为告警投递失败影响服务；`alert_outbox` 中的记录可用于人工排查。
+- `pool-ui` 是静态资源函数，不参与 heartbeat；建议用云监控或外部 uptime 做探活。
+
+告警文案面向客户说明“业务影响 + 处理建议”，`pool-api` / `pool-worker` 等内部标识和最近心跳时间放在末尾；恢复后会发送恢复通知。
 
 ## 配置与安全
 

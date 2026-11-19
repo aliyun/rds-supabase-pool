@@ -183,6 +183,10 @@ export ALIBABA_CLOUD_ACCESS_KEY_SECRET="<RAM 用户 SK>"
 export REGION="cn-chengdu"
 export CLOUD_MODE="mock"
 
+# 可选：配置后启用钉钉告警；不配置时 heartbeat/watchdog 仍运行，但不向外部发送
+export DINGTALK_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=..."
+export DINGTALK_SECRET="SEC..."   # 仅钉钉机器人使用“加签”时需要
+
 ./edge/bootstrap.sh
 ```
 
@@ -227,9 +231,10 @@ DEPLOY_UI=0 ./edge/bootstrap.sh
 0. 源码模式首次构建 UI 时执行 `npm ci` 安装前端依赖
 1. 生成并写入 Edge Secrets（JWT 密钥、worker token、Supabase 应用密码等）。
 2. 部署 `pool-api`。
-3. 安装 `pg_cron` / `pg_net`，并按每分钟调度 worker。
-4. 按 `DEPLOY_UI` 部署 `pool-ui`（源码构建或 Release 产物）。
-5. 执行健康检查。
+3. 部署 `pool-notifier`（钉钉告警投递）。
+4. 安装 `pg_cron` / `pg_net`，并按每分钟调度 worker 和 health watchdog。
+5. 按 `DEPLOY_UI` 部署 `pool-ui`（源码构建或 Release 产物）。
+6. 执行健康检查。
 
 首次部署会把 worker token、实例地址和 service key 保存到 `edge/.bootstrap.env`（权限 0600，已加入 .gitignore），用于后续重新部署；请备份并妥善保管。
 
@@ -309,21 +314,65 @@ https://<domain>/functions/v1/pool-api
 
 ## 9. 升级 / 重新部署
 
-代码更新后，直接重新部署即可：
+代码更新后，直接执行：
 
 ```bash
-./edge/deploy.sh
+./edge/upgrade.sh
 ```
 
-`deploy.sh` 会自动读取 `edge/.bootstrap.env` 中的 `SUPABASE_URL`、`SUPABASE_SERVICE_KEY`、`WORKER_TOKEN` 和 `DEPLOY_UI`，不需要再 export。
+`upgrade.sh` 会自动读取 `edge/.bootstrap.env`，更新 `pool-api`、`pool-ui`、`pool-notifier`，重挂 worker/watchdog，并执行健康检查。`deploy.sh` 只作为内部部署实现，客户不需要直接调用。
 
-如果该文件丢失，重新设置这几个变量（`WORKER_TOKEN` 可重新生成）后执行部署，调度会自动使用新 token 重新挂载。
+如果 `.bootstrap.env` 丢失，需要先恢复部署配置；不要用 `bootstrap.sh` 对已有实例做升级，它可能重置 `pool_admin`、JWT/worker token 等配置。
 
 说明：
 
-- `deploy.sh` 会重新部署 API、重挂调度、构建并部署 UI。
+- 升级默认使用 release UI；可用 `DEPLOY_UI=source ./edge/upgrade.sh` 改从源码构建。
 - 调度使用 Edge 内部 `SUPABASE_URL`（VPC 地址），不会因为重新部署而变化。
 - Secrets 接口不会回显明文，`WORKER_TOKEN` 以本地 `.bootstrap.env` 为准；丢失时只能重新生成并重新部署。
+
+### 9.1 监控与告警（可选）
+
+控制面会记录两类 heartbeat：
+
+- `pool-api`：控制台 API 请求层；
+- `pool-worker`：`pool-api` 内部的后台任务/自动补货链路。
+
+`supabase_db` 中的 `pg_cron` 任务 `pool-health-watchdog` 每分钟检查心跳；超时后写入 `alert_outbox`，再由独立的 `pool-notifier` Edge Function 发送钉钉告警或恢复通知。
+
+#### Webhook 开关
+
+- 设置 `DINGTALK_WEBHOOK`：启用外部钉钉告警；
+- 不设置 `DINGTALK_WEBHOOK`：heartbeat 和 watchdog 仍运行，outbox 仍记录，但不调用 notifier，也不会产生 503 或影响主业务；
+- `DINGTALK_SECRET`：仅机器人使用“加签”时设置；使用自定义关键词时可以不配置。
+
+`bootstrap.sh` 会把环境变量中的这两个可选 Secret 写入 Edge Secrets。`upgrade.sh` 默认不修改 Secrets；已有实例新增或更换 webhook 时，可以直接执行：
+
+```bash
+DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
+```
+
+只有显式提供 `DINGTALK_WEBHOOK` 时才会更新相关 Secret；不提供时保留现有配置。`DINGTALK_SECRET` 不提供时，保留已有 Secret。
+
+#### 重新部署后的行为
+
+- `upgrade.sh` 会重新部署 `pool-api`、`pool-ui` 和 `pool-notifier`；
+- scheduler setup 会重挂 `pool-worker-tick` 和 `pool-health-watchdog`；
+- scheduler setup 同时根据当前 `DINGTALK_WEBHOOK` 是否配置，更新 `monitor_config.notifications_enabled`；
+- 因此修改 webhook 后必须重新执行升级，开关才会更新；
+- 旧版本代码或未重新部署的实例不会自动获得 heartbeat/watchdog/notifier。
+
+告警文案面向客户说明“业务影响 + 处理建议”，内部组件标识和最近心跳时间放在末尾；服务恢复后会发送恢复通知。
+
+#### 验证
+
+部署后可以检查：
+
+```bash
+curl -H "X-Worker-Token: <WORKER_TOKEN>" \
+  https://<domain>/functions/v1/pool-api/api/internal/scheduler/status
+```
+
+预期能看到 `pool-worker-tick`、`pool-health-watchdog` 和 heartbeat 记录。未配置 webhook 时，告警只保留在 `alert_outbox`，不会向钉钉发送。
 
 ---
 
@@ -345,9 +394,11 @@ curl -H "X-Worker-Token: <WORKER_TOKEN>" \
 
 - `health` 返回 `status: ok`，`cloud_mode: real`
 - 调度 `jobs.active = true`，`runs.status = succeeded`
+- `scheduler/status` 能返回 `heartbeat`，且 `pool-api` / `pool-worker` 的 `last_seen_at` 持续更新
 - 预热任务从 `pending` 自动推进到 `succeeded`
 - 使用者申请后实例进入 `InUse / Running`
 - 归还后实例回到 `InCold / Stopped`
+- 配置 webhook 时，模拟心跳超时能收到告警，恢复后能收到恢复通知；未配置时不应出现 notifier 503
 
 ---
 
@@ -357,11 +408,14 @@ curl -H "X-Worker-Token: <WORKER_TOKEN>" \
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | 健康检查 500 / 连接超时          | 检查 `CONTROL_DB_URL`、数据库密码、PG 白名单是否包含 Edge 出口 IP；不建议放开 `0.0.0.0/0`                           |
 | 自动白名单失败                   | 给部署账号 `ModifySecurityIps` 权限，或手动加白名单                                                                 |
-| 调度 `ok=false` 或 worker 不执行 | 查看 `deploy.sh` 输出的 `tick_url`；正常应为内网 `http://172.x.x.x:80/...`，若为 sandbox 域名请重新执行 `deploy.sh` |
+| 调度 `ok=false` 或 worker 不执行 | 查看调度输出的 `tick_url`；正常应为内网 `http://172.x.x.x:80/...`，若为 sandbox 域名请重新执行 `./edge/upgrade.sh` |
 | 预检服务关联角色警告             | 到 RAM 补授权，不影响核心流程                                                                                       |
 | 账单权限警告                     | 给账号 BSS 只读权限                                                                                                 |
-| UI 静态资源 404                  | 使用 `DEPLOY_UI=1 ./edge/deploy.sh` 重新构建部署                                                                    |
+| UI 静态资源 404                  | 执行 `DEPLOY_UI=source ./edge/upgrade.sh` 重新构建部署                                                              |
 | 域名证书异常                     | 域名以 `DescribeInstanceEndpoints` 返回的 `Domain` 为准，不要手工拼接；没有公网 Domain 时才回退公网 IP              |
+| 未收到钉钉告警                   | 检查 `DINGTALK_WEBHOOK` 是否写入 Edge Secret；确认 `monitor_config.notifications_enabled=true`；加签机器人还需 `DINGTALK_SECRET` |
+| 钉钉返回 310000 / sign not match | 检查加签 Secret、时间戳和机器人安全设置；关键词安全模式不需要加签 Secret                                             |
+| 未配置 webhook 但想看告警         | 目前只记录在 `supabase_db.alert_outbox`，不会调用 notifier；配置 webhook 后重新执行 `./edge/upgrade.sh`              |
 
 ---
 

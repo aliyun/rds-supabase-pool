@@ -126,6 +126,8 @@ CLOUD_MODE="$CLOUD_MODE" \
 AUTO_WHITELIST="$AUTO_WHITELIST" \
 DEFAULT_REGION="$DEFAULT_REGION" \
 CONTROL_DB_URL="$CONTROL_DB_URL" \
+DINGTALK_WEBHOOK="${DINGTALK_WEBHOOK:-}" \
+DINGTALK_SECRET="${DINGTALK_SECRET:-}" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="$ALIBABA_CLOUD_ACCESS_KEY_ID" \
 ALIBABA_CLOUD_ACCESS_KEY_SECRET="$ALIBABA_CLOUD_ACCESS_KEY_SECRET" \
 ALIBABA_CLOUD_SECURITY_TOKEN="${ALIBABA_CLOUD_SECURITY_TOKEN:-}" \
@@ -141,6 +143,8 @@ names = [
     "CLOUD_MODE",
     "AUTO_WHITELIST",
     "DEFAULT_REGION",
+    "DINGTALK_WEBHOOK",
+    "DINGTALK_SECRET",
     "ALIBABA_CLOUD_ACCESS_KEY_ID",
     "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
     "ALIBABA_CLOUD_SECURITY_TOKEN",
@@ -233,6 +237,5 @@ echo "  4. 共享池添加 Running 的真实 PG，或对单租池执行预热"
 echo
 echo "worker token 已保存到 edge/.bootstrap.env（请备份）。"
 echo "后续重新部署只需要："
-echo "  export SUPABASE_URL=... SUPABASE_SERVICE_KEY=..."
-echo "  ./edge/deploy.sh"
-echo "deploy.sh 会自动读取 edge/.bootstrap.env 中的 worker token。"
+echo "  ./edge/upgrade.sh"
+echo "upgrade.sh 会自动读取 edge/.bootstrap.env 中的部署配置。"

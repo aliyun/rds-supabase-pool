@@ -60,6 +60,10 @@ export ALIBABA_CLOUD_ACCESS_KEY_SECRET="<ram-access-key-secret>"
 export REGION="cn-hangzhou"
 export CLOUD_MODE="mock"
 
+# Optional: enable DingTalk alerts. Leave unset to keep alerts internal only.
+export DINGTALK_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=..."
+export DINGTALK_SECRET="SEC..."   # required only for a signed robot
+
 ./edge/bootstrap.sh
 ```
 
@@ -84,6 +88,24 @@ risk. See [docs/deployment.en.md](docs/deployment.en.md) for the concise
 English deployment guide and [docs/deployment.md](docs/deployment.md) for the
 full guide.
 
+## Upgrade / recover an existing instance
+
+There is no need to rerun `bootstrap.sh` on an existing instance. Run:
+
+```bash
+./edge/upgrade.sh
+```
+
+The script loads the initial deployment's `edge/.bootstrap.env`, updates `pool-api`, `pool-ui`, `pool-notifier` and the watchdog, and runs a health check.
+
+To add or replace DingTalk alerting:
+
+```bash
+DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
+```
+
+If `edge/.bootstrap.env` is missing, restore the deployment configuration first by following the deployment guide. Do not use `bootstrap.sh` for upgrades or recovery on an existing instance.
+
 ## User API and CLI
 
 Create a PAT in the portal, then:
@@ -98,6 +120,25 @@ poolctl release my-app --yes --wait
 ```
 
 See [docs/api.md](docs/api.md).
+
+## Monitoring and alerts
+
+The control plane records heartbeats for the `pool-api` request layer and the background worker chain. A `pg_cron` watchdog in `supabase_db` writes stale-heartbeat events to `alert_outbox`; a separate `pool-notifier` Edge Function sends DingTalk alerts and recovery notices.
+
+- **`DINGTALK_WEBHOOK` is the external alert switch.** When set, DingTalk delivery is enabled. When omitted, heartbeats, the watchdog and the outbox remain active, but the notifier is not called and the main service is unaffected.
+- `DINGTALK_SECRET` is only required when the robot uses signing; a keyword-secured robot does not need it.
+- For a new deployment, pass both optional values to `bootstrap.sh`; it writes them to Edge Secrets.
+- For an existing deployment, use `./edge/upgrade.sh`. It updates `pool-api` / `pool-ui` / `pool-notifier` and re-hooks the watchdog. It does not change Edge Secrets by default; to add or replace the webhook, run:
+
+```bash
+DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
+```
+
+The optional secrets are updated only when `DINGTALK_WEBHOOK` is explicitly provided; otherwise the existing configuration is preserved.
+- With no webhook configured, failed delivery does not affect the service; `alert_outbox` remains available for inspection.
+- `pool-ui` is a static function and has no heartbeat; monitor it with cloud monitoring or an external uptime check.
+
+Alert text is written for customers: impact and recommended action come first; internal identifiers and heartbeat timestamps are at the end. A recovery notice is sent when service health returns.
 
 ## Security
 
