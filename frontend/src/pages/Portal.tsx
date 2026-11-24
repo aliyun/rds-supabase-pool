@@ -22,6 +22,7 @@ import { cx, formatDateTime, MODE_META, relativeTime } from "../lib/format";
 import type {
   AuthInfo,
   EndpointsInfo,
+  InstanceNetwork,
   PlatformToken,
   PortalInstance,
   PortalOverview,
@@ -54,6 +55,7 @@ export function PortalApp() {
   const [applyMode, setApplyMode] = useState<"single" | "shared">("shared");
   const [applyAppName, setApplyAppName] = useState("");
   const [connectionTarget, setConnectionTarget] = useState<PortalInstance | null>(null);
+  const [networkTarget, setNetworkTarget] = useState<PortalInstance | null>(null);
   const [releaseTarget, setReleaseTarget] = useState<PortalInstance | null>(null);
   const [tokensOpen, setTokensOpen] = useState(false);
   const [docsOpen, setDocsOpen] = useState(false);
@@ -320,6 +322,16 @@ export function PortalApp() {
                             </Button>
                           ) : null}
                           {instance.status === "InUse" ? (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              icon={<ShieldCheck size={12} />}
+                              onClick={() => setNetworkTarget(instance)}
+                            >
+                              白名单
+                            </Button>
+                          ) : null}
+                          {instance.status === "InUse" ? (
                             <Button size="sm" variant="ghost" onClick={() => setReleaseTarget(instance)}>
                               归还
                             </Button>
@@ -405,6 +417,9 @@ export function PortalApp() {
       />
       {connectionTarget ? (
         <ConnectionModal instance={connectionTarget} onClose={() => setConnectionTarget(null)} />
+      ) : null}
+      {networkTarget ? (
+        <NetworkModal instance={networkTarget} onClose={() => setNetworkTarget(null)} />
       ) : null}
       <TokenModal open={tokensOpen} onClose={() => setTokensOpen(false)} />
       <DeveloperDocsModal
@@ -519,6 +534,8 @@ function ApplyModal({
   const [regionId, setRegionId] = useState(initialRegion);
   const [mode, setMode] = useState<"single" | "shared">(initialMode);
   const [appName, setAppName] = useState(initialAppName);
+  const [networkMode, setNetworkMode] = useState<"restricted" | "public">("restricted");
+  const [cidrs, setCidrs] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -537,6 +554,8 @@ function ApplyModal({
     setRegionId(region?.region_id || "");
     setMode(pool?.mode || initialMode);
     setAppName(initialAppName);
+    setNetworkMode("restricted");
+    setCidrs("");
     setError(null);
     // 轮询更新 regions 时不要重置用户正在填写的表单
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -544,19 +563,36 @@ function ApplyModal({
 
   const selectedRegion = regions.find((item) => item.region_id === regionId);
   const selectedPool = selectedRegion?.pools.find((item) => item.mode === mode) || selectedRegion?.pools[0] || null;
+  const canEditNetwork = selectedPool?.network_policy?.allow_user_edit !== false;
+  const allowPublic = selectedPool?.network_policy?.allow_public_access !== false;
 
   const changeRegion = (next: string) => {
     setRegionId(next);
     const region = regions.find((item) => item.region_id === next);
     const pool = region?.pools.find((item) => item.available > 0) || region?.pools[0];
     setMode(pool?.mode || "shared");
+    setNetworkMode("restricted");
+    setCidrs("");
   };
 
   const submit = async () => {
     setSubmitting(true);
     setError(null);
     try {
-      await api.portalApply({ region_id: regionId, app_name: appName.trim(), mode });
+      const effectiveMode = allowPublic ? networkMode : "restricted";
+      const network = canEditNetwork
+        ? {
+            mode: effectiveMode,
+            cidrs:
+              effectiveMode === "restricted"
+                ? cidrs
+                    .split(/[\s,]+/)
+                    .map((item) => item.trim())
+                    .filter(Boolean)
+                : [],
+          }
+        : undefined;
+      await api.portalApply({ region_id: regionId, app_name: appName.trim(), mode, network });
       push("success", "申请已提交，实例正在唤醒");
       onApplied();
     } catch (err) {
@@ -628,6 +664,39 @@ function ApplyModal({
             autoFocus
           />
         </Field>
+        {canEditNetwork ? (
+          <>
+            <Field label="网络访问" hint="公网开放需要管理员策略允许">
+              <Select
+                value={networkMode}
+                onChange={(event) => setNetworkMode(event.target.value as "restricted" | "public")}
+              >
+                <option value="restricted">仅指定 IP / CIDR</option>
+                <option value="public" disabled={!allowPublic}>
+                  公网开放（任意地址）
+                </option>
+              </Select>
+            </Field>
+            {networkMode === "restricted" ? (
+              <Field label="应用出口 IP / CIDR" hint="逗号分隔，例如 203.0.113.10/32, 198.51.100.0/24">
+                <Input
+                  value={cidrs}
+                  onChange={(event) => setCidrs(event.target.value)}
+                  placeholder="203.0.113.10/32"
+                />
+              </Field>
+            ) : null}
+            {networkMode === "restricted" && !cidrs.trim() ? (
+              <div className="rounded-lg border border-amber/25 bg-amber/[0.06] px-3 py-2.5 text-[10px] leading-5 text-amber">
+                暂未填写 IP 时实例会先分配，但外部暂时无法访问；可在连接信息中继续配置白名单。
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <div className="rounded-lg border border-edge bg-white/[0.02] px-3 py-2.5 text-[10px] leading-5 text-slate-500">
+            网络白名单由管理员统一配置；实例创建后可在连接信息中查看当前状态。
+          </div>
+        )}
         <div className="rounded-lg border border-cyan/20 bg-cyan/[0.04] px-3 py-2.5 text-[11px] leading-5 text-slate-400">
           申请成功后实例会从冷池唤醒并绑定该应用。归还后实例保留给同名应用再次使用；使用者没有删除权限。
         </div>
@@ -673,6 +742,8 @@ function DeveloperDocsModal({
     ["GET", "/api/v1/portal/instances/{instance_id}", "instances:read", "查看单个实例"],
     ["GET", "/api/v1/portal/instances/{instance_id}/endpoints", "credentials:read", "获取连接地址"],
     ["GET", "/api/v1/portal/instances/{instance_id}/auth-info", "credentials:read", "获取 API 密钥"],
+    ["GET", "/api/v1/portal/instances/{instance_id}/network", "network:read", "查看网络白名单"],
+    ["PATCH", "/api/v1/portal/instances/{instance_id}/network", "network:write", "更新网络白名单"],
     ["POST", "/api/v1/portal/instances/{instance_id}/release", "instances:release", "归还实例（不可删除）"],
   ];
 
@@ -736,11 +807,17 @@ curl -s "$BASE/v1/portal/overview" \\
 curl -s -X POST "$BASE/v1/portal/instances/apply" \\
   -H "Authorization: Bearer $TOKEN" \\
   -H "Content-Type: application/json" \\
-  -d '{"region_id":"cn-chengdu","mode":"shared","app_name":"my-app"}'
+  -d '{"region_id":"cn-chengdu","mode":"shared","app_name":"my-app","network":{"mode":"restricted","cidrs":["203.0.113.10/32"]}}'
 
 # 用返回的 task_id 查询进度
 curl -s "$BASE/v1/portal/tasks/<task_id>" \\
-  -H "Authorization: Bearer $TOKEN"`}
+  -H "Authorization: Bearer $TOKEN"
+
+# 更新白名单
+curl -s -X PATCH "$BASE/v1/portal/instances/<instance_id>/network" \\
+  -H "Authorization: Bearer $TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{"mode":"restricted","cidrs":["203.0.113.10/32"]}'`}
             />
             <div className="overflow-hidden rounded-lg border border-edge">
               <div className="grid grid-cols-[60px_1fr_130px] gap-2 bg-white/[0.03] px-3 py-2 text-[9px] uppercase tracking-wider text-slate-500">
@@ -781,8 +858,9 @@ poolctl login --url ${apiRoot} --token pctl_xxx`}
               onCopy={(value) => copy("CLI 命令", value)}
               code={`poolctl regions
 poolctl apps
-poolctl apply --region cn-chengdu --mode shared --app my-app --wait
+poolctl apply --region cn-chengdu --mode shared --app my-app --allow-cidr 203.0.113.10/32 --wait
 poolctl get my-app
+poolctl network my-app
 poolctl connect my-app --env
 poolctl connect my-app --env --show-secrets
 poolctl release my-app --yes --wait
@@ -835,6 +913,8 @@ function TokenModal({ open, onClose }: { open: boolean; onClose: () => void }) {
     "instances:apply",
     "instances:release",
     "credentials:read",
+    "network:read",
+    "network:write",
   ]);
   const [creating, setCreating] = useState(false);
   const [newToken, setNewToken] = useState<string | null>(null);
@@ -898,6 +978,8 @@ function TokenModal({ open, onClose }: { open: boolean; onClose: () => void }) {
     "instances:apply": "申请实例",
     "instances:release": "归还实例",
     "credentials:read": "读取连接密钥",
+    "network:read": "查看网络白名单",
+    "network:write": "修改网络白名单",
   };
 
   return (
@@ -1119,6 +1201,115 @@ function ReleaseModal({
           </div>
         ) : null}
       </div>
+    </Modal>
+  );
+}
+
+function NetworkModal({ instance, onClose }: { instance: PortalInstance; onClose: () => void }) {
+  const { push } = useToast();
+  const [network, setNetwork] = useState<InstanceNetwork | null>(null);
+  const [mode, setMode] = useState<"restricted" | "public">("restricted");
+  const [cidrs, setCidrs] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await api.portalNetwork(instance.id);
+      setNetwork(data);
+      setMode(data.mode === "public" ? "public" : "restricted");
+      setCidrs((data.cidrs || []).join(", "));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [instance.id]);
+
+  const save = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await api.updatePortalNetwork(instance.id, {
+        mode,
+        cidrs:
+          mode === "restricted"
+            ? cidrs
+                .split(/[\s,]+/)
+                .map((item) => item.trim())
+                .filter(Boolean)
+            : [],
+      });
+      setNetwork(updated);
+      push("success", "网络白名单已更新");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="网络白名单"
+      subtitle={`${instance.app_name} · ${instance.region_name}`}
+      width="max-w-xl"
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            关闭
+          </Button>
+          <Button variant="primary" loading={saving} disabled={loading} onClick={() => void save()}>
+            保存白名单
+          </Button>
+        </>
+      }
+    >
+      {loading ? (
+        <div className="flex justify-center py-10">
+          <Spinner size={20} />
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <div className="rounded-lg border border-edge bg-white/[0.02] px-3 py-2.5 text-[10px] leading-5 text-slate-500">
+            只允许列出的应用出口 IP/CIDR 访问 Supabase 公网端点；冷池和归还时会自动关闭为 127.0.0.1。
+          </div>
+          <Field label="访问模式">
+            <Select value={mode} onChange={(event) => setMode(event.target.value as "restricted" | "public")}>
+              <option value="restricted">仅指定 IP / CIDR</option>
+              <option value="public">公网开放（任意地址）</option>
+            </Select>
+          </Field>
+          {mode === "restricted" ? (
+            <Field label="应用出口 IP / CIDR" hint="逗号分隔，例如 203.0.113.10/32, 198.51.100.0/24">
+              <Input value={cidrs} onChange={(event) => setCidrs(event.target.value)} placeholder="203.0.113.10/32" />
+            </Field>
+          ) : (
+            <div className="rounded-lg border border-amber/25 bg-amber/[0.06] px-3 py-2.5 text-[10px] leading-5 text-amber">
+              公网开放后任意地址都可以访问端点。请确保 Service Key 只在服务端使用，并正确配置 Supabase RLS。
+            </div>
+          )}
+          {network ? (
+            <div className="rounded-lg border border-edge bg-white/[0.02] px-3 py-2.5 text-[10px] leading-5 text-slate-500">
+              当前状态：{network.state}；生效白名单：{network.desired?.join(", ") || "—"}
+              {network.observed ? `；云端读取：${network.observed.join(", ") || "空"}` : ""}
+            </div>
+          ) : null}
+          {error ? (
+            <div className="rounded-lg border border-rose/30 bg-rose/[0.07] px-3 py-2.5 text-[11px] text-rose">{error}</div>
+          ) : null}
+        </div>
+      )}
     </Modal>
   );
 }

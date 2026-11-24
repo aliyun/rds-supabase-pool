@@ -19,7 +19,7 @@ The deployment script does not create the control-plane instance.
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.0"
+export POOL_UI_RELEASE_TAG="v0.1.1"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<strong-password>"
@@ -51,7 +51,7 @@ performs a health check.
 ### UI deployment modes
 
 Customer deployments use a prebuilt GitHub Release artifact and do not require
-Node/npm. The corresponding release must contain `pool-ui-v0.1.0.ts` and its
+Node/npm. The corresponding release must contain `pool-ui-v0.1.1.ts` and its
 `.sha256`; the script verifies the checksum and aborts on mismatch.
 
 For source development or release building, use `DEPLOY_UI=source` (requires
@@ -64,10 +64,10 @@ DEPLOY_UI=source ./edge/bootstrap.sh
 To update only the API, use `DEPLOY_UI=0`. Build release assets with:
 
 ```bash
-./scripts/build-ui-release.sh v0.1.0
+./scripts/build-ui-release.sh v0.1.1
 ```
 
-Then upload `edge/.build/release/pool-ui-v0.1.0.ts` and `.sha256` to the
+Then upload `edge/.build/release/pool-ui-v0.1.1.ts` and `.sha256` to the
 corresponding GitHub Release. `POOL_UI_RELEASE_REPO` and
 `POOL_UI_RELEASE_URL` can override the default download location.
 

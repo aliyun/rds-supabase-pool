@@ -1,5 +1,27 @@
 export type CloudMode = "real" | "mock";
 export type PoolMode = "single" | "shared";
+export type NetworkMode = "restricted" | "public";
+
+export interface NetworkPolicy {
+  allow_user_edit: boolean;
+  allow_public_access: boolean;
+  max_cidrs: number;
+}
+
+export interface InstanceNetwork {
+  managed: boolean;
+  mode: NetworkMode;
+  cidrs: string[];
+  desired: string[];
+  state: string;
+  last_applied_at: string | null;
+  last_verified_at: string | null;
+  last_error: string;
+  updated_by: string;
+  observed?: string[] | null;
+  read_error?: string;
+  groups?: { group_name: string; cidrs: string[] }[];
+}
 
 export interface PoolSettings {
   target: number;
@@ -22,6 +44,7 @@ export interface PoolSettings {
   shared_pg_engine_version: string;
   single_pg_security_ips: string;
   public_endpoint_enabled: boolean;
+  network_policy: NetworkPolicy;
 }
 
 export interface MetadataPgSettings {
@@ -274,6 +297,7 @@ export interface PortalRegionPool {
   in_use: number;
   target: number;
   max: number;
+  network_policy: NetworkPolicy;
 }
 
 export interface PortalRegion {
@@ -304,6 +328,7 @@ export interface PortalInstance {
   public_connection: string | null;
   vpc_connection: string | null;
   cloud_status: string | null;
+  network: InstanceNetwork;
   error: string | null;
   created_at: string | null;
   updated_at: string | null;
@@ -373,6 +398,7 @@ export interface InstanceDetail {
   bound_app_name?: string;
   reserved?: boolean;
   reserved_app_name?: string;
+  network?: InstanceNetwork;
   [key: string]: unknown;
 }
 

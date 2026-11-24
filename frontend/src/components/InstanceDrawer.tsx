@@ -29,7 +29,7 @@ import {
   STATUS_META,
 } from "../lib/format";
 import { useAppData } from "../lib/store";
-import type { AuditEvent, AuthInfo, DatabaseSizeInfo, EndpointsInfo, Instance, ResourceInfo } from "../lib/types";
+import type { AuditEvent, AuthInfo, DatabaseSizeInfo, EndpointsInfo, Instance, InstanceNetwork, ResourceInfo } from "../lib/types";
 import { AllocateModal, ConfirmDialog, ReleaseDialog } from "./PoolActions";
 import {
   Badge,
@@ -82,6 +82,11 @@ export function InstanceDrawer({
   const [auth, setAuth] = useState<AuthInfo | null>(null);
   const [resource, setResource] = useState<ResourceInfo | null>(null);
   const [size, setSize] = useState<DatabaseSizeInfo | null>(null);
+  const [network, setNetwork] = useState<InstanceNetwork | null>(null);
+  const [networkMode, setNetworkMode] = useState<"restricted" | "public">("restricted");
+  const [networkCidrs, setNetworkCidrs] = useState("");
+  const [savingNetwork, setSavingNetwork] = useState(false);
+  const [networkError, setNetworkError] = useState<string | null>(null);
   const [liveError, setLiveError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -111,10 +116,18 @@ export function InstanceDrawer({
         api.authInfo(instanceId),
         api.resource(instanceId),
         api.databaseSize(instanceId),
+        api.network(instanceId),
       ]);
-      const [ep, au, re, sz] = results;
+      const [ep, au, re, sz, nw] = results;
       setEndpoints(ep.status === "fulfilled" ? ep.value : null);
       setAuth(au.status === "fulfilled" ? au.value : null);
+      if (nw.status === "fulfilled") {
+        setNetwork(nw.value);
+        setNetworkMode(nw.value.mode === "public" ? "public" : "restricted");
+        setNetworkCidrs((nw.value.cidrs || []).join(", "));
+      } else {
+        setNetwork(null);
+      }
       if (re.status === "fulfilled") {
         setResource(re.value);
         setCpu(re.value.cpu_cores || "");
@@ -177,6 +190,33 @@ export function InstanceDrawer({
     } finally {
       setBusyAction(null);
       setConfirmAction(null);
+    }
+  };
+
+  const saveNetwork = async () => {
+    if (!instance) return;
+    setSavingNetwork(true);
+    setNetworkError(null);
+    try {
+      const updated = await api.updateNetwork(instance.id, {
+        mode: networkMode,
+        cidrs:
+          networkMode === "restricted"
+            ? networkCidrs
+                .split(/[\s,]+/)
+                .map((item) => item.trim())
+                .filter(Boolean)
+            : [],
+      });
+      setNetwork(updated);
+      setNetworkMode(updated.mode === "public" ? "public" : "restricted");
+      setNetworkCidrs((updated.cidrs || []).join(", "));
+      push("success", "网络白名单已更新");
+      await load();
+    } catch (error) {
+      setNetworkError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSavingNetwork(false);
     }
   };
 
@@ -463,6 +503,52 @@ export function InstanceDrawer({
                       </table>
                     </div>
                   ) : null}
+                </Card>
+
+                <Card className="p-4" noCorners>
+                  <div className="mb-3 flex items-center gap-2">
+                    <Link2 size={14} className="text-violet" />
+                    <span className="display-title text-xs text-slate-200">Supabase 网络白名单</span>
+                  </div>
+                  {network ? (
+                    <div className="space-y-3">
+                      <div className="grid gap-2 text-[10px] text-slate-500 sm:grid-cols-2">
+                        <div>状态：<span className="text-slate-300">{network.state}</span></div>
+                        <div>模式：<span className="text-slate-300">{network.mode}</span></div>
+                        <div className="sm:col-span-2">
+                          生效：<span className="mono text-slate-300">{network.desired?.join(", ") || "—"}</span>
+                        </div>
+                        <div className="sm:col-span-2">
+                          云端：<span className="mono text-slate-400">{network.observed?.join(", ") || "—"}</span>
+                          {network.read_error ? <span className="text-rose"> ({network.read_error})</span> : null}
+                        </div>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <Field label="访问模式">
+                          <Select
+                            value={networkMode}
+                            onChange={(event) => setNetworkMode(event.target.value as "restricted" | "public")}
+                          >
+                            <option value="restricted">仅指定 IP / CIDR</option>
+                            <option value="public">公网开放</option>
+                          </Select>
+                        </Field>
+                        {networkMode === "restricted" ? (
+                          <Field label="IP / CIDR" hint="逗号分隔">
+                            <Input value={networkCidrs} onChange={(event) => setNetworkCidrs(event.target.value)} />
+                          </Field>
+                        ) : null}
+                      </div>
+                      {networkError ? <div className="text-[10px] text-rose">{networkError}</div> : null}
+                      <div className="flex justify-end">
+                        <Button size="sm" variant="primary" loading={savingNetwork} onClick={() => void saveNetwork()}>
+                          保存白名单
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-slate-600">暂无网络白名单信息</div>
+                  )}
                 </Card>
 
                 <Card className="p-4" noCorners>

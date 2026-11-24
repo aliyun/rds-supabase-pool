@@ -56,7 +56,7 @@ flowchart LR
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.0"
+export POOL_UI_RELEASE_TAG="v0.1.1"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<8~32 位，至少包含大写/小写/数字/特殊字符中的三类>"
@@ -72,7 +72,7 @@ export DINGTALK_SECRET="SEC..."   # required only for a signed robot
 ./edge/bootstrap.sh
 ```
 
-> Release 模式需要对应 GitHub Release 已上传 `pool-ui-v0.1.0.ts` 和 `.sha256`。
+> Release 模式需要对应 GitHub Release 已上传 `pool-ui-v0.1.1.ts` 和 `.sha256`。
 > 开发或尚未发布 Release 时，使用源码构建：`DEPLOY_UI=source ./edge/bootstrap.sh`（需要 Node/npm）。
 > 只更新 API：`DEPLOY_UI=0 ./edge/bootstrap.sh`。
 
@@ -137,12 +137,14 @@ DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
 python3 -m pip install -e cli
 poolctl login --url https://<domain>/functions/v1/pool-api --token pctl_xxx
 poolctl regions
-poolctl apply --region cn-hangzhou --mode shared --app my-app --wait
+poolctl apply --region cn-hangzhou --mode shared --app my-app \
+  --allow-cidr 203.0.113.10/32 --wait
 poolctl connect my-app --env
+poolctl network my-app
 poolctl release my-app --yes --wait
 ```
 
-Token 只能访问 `/api/v1/portal/*`，不能访问管理端、成本、任务日志或云凭证。详见 [docs/api.md](docs/api.md)。
+需要全网访问时可显式使用 `--public`，但仍受池级网络策略控制。冷池和归还时会自动把 Supabase 实例白名单重置为 `127.0.0.1`。Token 只能访问 `/api/v1/portal/*`，不能访问管理端、成本、任务日志或云凭证。详见 [docs/api.md](docs/api.md)。
 
 ## 监控与告警
 
@@ -170,6 +172,7 @@ DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
 - 管理台使用 HttpOnly JWT Cookie；PAT 只保存 SHA-256 哈希，支持 scope、有效期和撤销。
 - 使用者只能看到并操作自己的实例；删除操作仅管理员可执行。
 - 默认 Mock 模式不创建业务云资源；真实模式请使用最小权限 RAM 用户，并避免长期放开 PG 白名单。
+- Supabase 实例白名单由生命周期自动维护：冷池 `127.0.0.1`，分配时按使用者 CIDR 放行，归还时先重置再停止。公网开放需要显式选择，并受池级策略控制。
 - 不要在公开内容中粘贴真实凭证、实例 ID 或客户数据。
 
 ## 目录

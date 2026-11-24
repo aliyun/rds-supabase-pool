@@ -836,6 +836,58 @@ function PoolConfigModal({ pool, onClose, onSaved }: { pool: RegionPool; onClose
           </div>
         </div>
 
+        <div className="mt-3 rounded-xl border border-edge bg-white/[0.02] p-4">
+          <div className="display-title text-xs text-slate-200">Supabase 网络策略</div>
+          <div className="mt-3 flex flex-wrap items-center gap-4">
+            <Toggle
+              checked={config.network_policy?.allow_user_edit !== false}
+              onChange={(value) =>
+                setConfig({
+                  ...config,
+                  network_policy: {
+                    ...(config.network_policy || { allow_user_edit: true, allow_public_access: true, max_cidrs: 8 }),
+                    allow_user_edit: value,
+                  },
+                })
+              }
+              label="允许使用者修改白名单"
+            />
+            <Toggle
+              checked={config.network_policy?.allow_public_access !== false}
+              onChange={(value) =>
+                setConfig({
+                  ...config,
+                  network_policy: {
+                    ...(config.network_policy || { allow_user_edit: true, allow_public_access: true, max_cidrs: 8 }),
+                    allow_public_access: value,
+                  },
+                })
+              }
+              label="允许公网开放"
+            />
+            <Field label="最多 CIDR 数">
+              <Input
+                type="number"
+                min={1}
+                max={32}
+                value={config.network_policy?.max_cidrs ?? 8}
+                onChange={(event) =>
+                  setConfig({
+                    ...config,
+                    network_policy: {
+                      ...(config.network_policy || { allow_user_edit: true, allow_public_access: true, max_cidrs: 8 }),
+                      max_cidrs: Math.max(1, Math.min(32, Number(event.target.value) || 1)),
+                    },
+                  })
+                }
+              />
+            </Field>
+          </div>
+          <div className="mt-2 text-[10px] leading-5 text-slate-500">
+            白名单作用于 Supabase 实例公网端点；冷池默认关闭，归还时自动重置。下方 PG 白名单只影响 PostgreSQL 直连。
+          </div>
+        </div>
+
         {pool.mode === "single" ? (
           <div className="rounded-xl border border-edge bg-white/[0.02] p-4">
             <div className="display-title text-xs text-slate-200">单租 PG 规格</div>

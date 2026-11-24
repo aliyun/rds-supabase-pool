@@ -174,7 +174,7 @@ export AUTO_WHITELIST=false
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.0"
+export POOL_UI_RELEASE_TAG="v0.1.1"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<8~32 位，至少含大写/小写/数字/特殊字符中的三类>"
@@ -194,7 +194,7 @@ export DINGTALK_SECRET="SEC..."   # 仅钉钉机器人使用“加签”时需�
 
 ### UI 部署模式
 
-客户部署默认使用 Release 产物，无需安装 Node/npm；前提是对应 GitHub Release 已上传 `pool-ui-v0.1.0.ts` 和 `.sha256`。脚本会下载并校验 SHA256，校验失败会中止。
+客户部署默认使用 Release 产物，无需安装 Node/npm；前提是对应 GitHub Release 已上传 `pool-ui-v0.1.1.ts` 和 `.sha256`。脚本会下载并校验 SHA256，校验失败会中止。
 
 源码开发或发版时使用 `DEPLOY_UI=source`（脚本默认值，需要 Node 20.19+）：
 
@@ -211,10 +211,10 @@ DEPLOY_UI=0 ./edge/bootstrap.sh
 构建 Release 产物：
 
 ```bash
-./scripts/build-ui-release.sh v0.1.0
+./scripts/build-ui-release.sh v0.1.1
 ```
 
-生成 `edge/.build/release/pool-ui-v0.1.0.ts` 和 `.sha256`，上传到对应 GitHub Release 即可。可用 `POOL_UI_RELEASE_REPO`、`POOL_UI_RELEASE_URL` 覆盖默认下载地址。
+生成 `edge/.build/release/pool-ui-v0.1.1.ts` 和 `.sha256`，上传到对应 GitHub Release 即可。可用 `POOL_UI_RELEASE_REPO`、`POOL_UI_RELEASE_URL` 覆盖默认下载地址。
 
 脚本会调用 RdsAi/RDS API 自动解析：
 
@@ -480,6 +480,8 @@ curl -H "X-Worker-Token: <WORKER_TOKEN>" \
         "rdsai:DescribeInstanceEndpoints",
         "rdsai:DescribeInstanceAuthInfo",
         "rdsai:DescribeInstanceDatabaseSize",
+        "rdsai:DescribeInstanceIpWhitelist",
+        "rdsai:ModifyInstanceIpWhitelist",
         "rdsai:DescribeDBInstanceCapacity",
         "rdsai:ModifyDBInstanceCapacity",
         "rdsai:EnableAgentRuntime"
@@ -516,6 +518,7 @@ curl -H "X-Worker-Token: <WORKER_TOKEN>" \
 - `bssapi:DescribeInstanceBill` 仅影响池成本页；不授予时预检会提示账单权限警告。
 - `ram:CreateServiceLinkedRole` 用于首次创建三个服务关联角色；如果主账号已经创建好，可以只保留 `ram:GetRole`。
 - `rdsai:EnableAgentRuntime` 仅创建控制面实例时需要；如果控制面由主账号创建，RAM 用户可以不授予。
+- `rdsai:DescribeInstanceIpWhitelist` / `rdsai:ModifyInstanceIpWhitelist` 用于池中 Supabase 实例的生命周期白名单管理，必须授予；它和 PostgreSQL 的 `rds:ModifySecurityIps` 是两套权限。
 - Edge 的自动白名单依赖 `rds:ModifySecurityIps`；不授予时设置 `AUTO_WHITELIST=false` 并手动加白。
 - 使用 RAM 用户的 AK/SK 填入 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET`，不需要使用主账号 AK。
 - 如果账号已有 RDS / RdsAi 的系统策略，也可以直接附加对应系统策略；上面的 JSON 适合做最小权限收敛。

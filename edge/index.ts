@@ -8,7 +8,10 @@ const JWT_SECRET = Deno.env.get("PLATFORM_JWT_SECRET") || "";
 if (!JWT_SECRET) throw new Error("PLATFORM_JWT_SECRET 未配置");
 let CLOUD_MODE = Deno.env.get("CLOUD_MODE") || "mock";
 const TOKEN_TTL = 7 * 24 * 3600;
-const SCOPES = ["instances:read", "instances:apply", "instances:release", "credentials:read"];
+const SCOPES = ["instances:read", "instances:apply", "instances:release", "credentials:read", "network:read", "network:write"];
+const NETWORK_CLOSED = ["127.0.0.1"];
+const NETWORK_PUBLIC = ["0.0.0.0/0"];
+const DEFAULT_NETWORK_POLICY = { allow_user_edit: true, allow_public_access: true, max_cidrs: 8 };
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -253,7 +256,7 @@ async function regionsPayload() {
     portal_enabled: !!region.portal_enabled,
     pools: pools.filter((pool: any) => pool.region_id === region.region_id).map((pool: any) => {
       const subset = instances.filter((inst: any) => inst.pool_id === pool.id);
-      const config = parseObject(pool.config);
+      const config = poolConfig(pool.config);
       return {
         ...pool,
         enabled: !!pool.enabled,
@@ -274,18 +277,26 @@ async function portalRegions() {
     .map((region: any) => {
       const mode = region.portal_pool_mode || "shared";
       const modes = mode === "both" ? ["single", "shared"] : [mode];
-      const pools = region.pools.filter((pool: any) => modes.includes(pool.mode) && pool.enabled).map((pool: any) => ({
-        mode: pool.mode,
-        mode_label: pool.mode === "single" ? "单租户池" : "多租共享池",
-        pool_id: pool.id,
-        pool_name: pool.name,
-        cold: pool.cold,
-        reserved: pool.reserved,
-        available: Math.max(0, pool.cold - pool.reserved),
-        in_use: pool.in_use,
-        target: pool.target,
-        max: pool.max,
-      }));
+      const pools = region.pools.filter((pool: any) => modes.includes(pool.mode) && pool.enabled).map((pool: any) => {
+        const policy = networkPolicy(pool.config);
+        return {
+          mode: pool.mode,
+          mode_label: pool.mode === "single" ? "单租户池" : "多租共享池",
+          pool_id: pool.id,
+          pool_name: pool.name,
+          cold: pool.cold,
+          reserved: pool.reserved,
+          available: Math.max(0, pool.cold - pool.reserved),
+          in_use: pool.in_use,
+          target: pool.target,
+          max: pool.max,
+          network_policy: {
+            allow_user_edit: policy.allow_user_edit,
+            allow_public_access: policy.allow_public_access,
+            max_cidrs: policy.max_cidrs,
+          },
+        };
+      });
       return {
         region_id: region.region_id,
         name: region.name || region.region_id,
@@ -323,6 +334,7 @@ async function portalInstances(userId: string) {
       public_connection: row.public_connection,
       vpc_connection: row.vpc_connection,
       cloud_status: row.cloud_status,
+      network: networkView(detail),
       error: row.error,
       created_at: row.created_at,
       updated_at: row.updated_at,
@@ -403,6 +415,129 @@ function parseObject(value: unknown): Record<string, any> {
     }
   }
   return {};
+}
+
+function normalizeIpv4Cidr(value: unknown): string {
+  const text = String(value || "").trim();
+  if (!text) throw new Error("IP/CIDR 不能为空");
+  const [rawIp, rawPrefix, ...rest] = text.split("/");
+  if (rest.length) throw new Error(`无法识别的 CIDR：${text}`);
+  const octets = rawIp.split(".");
+  if (octets.length !== 4 || octets.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255)) {
+    throw new Error(`仅支持 IPv4 地址或 CIDR：${text}`);
+  }
+  const prefix = rawPrefix === undefined || rawPrefix === "" ? 32 : Number(rawPrefix);
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) throw new Error(`CIDR 前缀无效：${text}`);
+  return `${octets.map((part) => String(Number(part))).join(".")}/${prefix}`;
+}
+
+function normalizeNetworkCidrs(value: unknown, max = 8): string[] {
+  const raw = Array.isArray(value)
+    ? value
+    : typeof value === "string" && value.trim()
+      ? value.split(",")
+      : [];
+  const result: string[] = [];
+  for (const item of raw) {
+    const cidr = normalizeIpv4Cidr(item);
+    if (!result.includes(cidr)) result.push(cidr);
+  }
+  if (result.length > max) throw new Error(`白名单最多允许 ${max} 条`);
+  return result;
+}
+
+function isPublicCidr(cidr: string): boolean {
+  return cidr === "0.0.0.0/0";
+}
+
+function networkPolicy(config: Record<string, any>): { allow_user_edit: boolean; allow_public_access: boolean; max_cidrs: number } {
+  const policy = parseObject(config?.network_policy);
+  const max = Number(policy.max_cidrs);
+  return {
+    allow_user_edit: policy.allow_user_edit !== false,
+    allow_public_access: policy.allow_public_access !== false,
+    max_cidrs: Number.isFinite(max) ? Math.max(1, Math.min(32, max)) : DEFAULT_NETWORK_POLICY.max_cidrs,
+  };
+}
+
+function safeNetworkCidrs(value: unknown, max = 32): string[] {
+  try {
+    return normalizeNetworkCidrs(value, max);
+  } catch {
+    return [];
+  }
+}
+
+function networkView(detail: Record<string, any>) {
+  const raw = parseObject(detail?.network);
+  const managed = raw.managed === true;
+  const mode = raw.mode === "public" ? "public" : "restricted";
+  const state = ["pending", "closed", "applying", "applied", "resetting", "error", "unknown"].includes(String(raw.state))
+    ? String(raw.state)
+    : "unknown";
+  return {
+    managed,
+    mode,
+    cidrs: safeNetworkCidrs(raw.cidrs),
+    desired: safeNetworkCidrs(raw.desired),
+    state,
+    last_applied_at: raw.last_applied_at || null,
+    last_verified_at: raw.last_verified_at || null,
+    last_error: raw.last_error || "",
+    updated_by: raw.updated_by || "",
+  };
+}
+
+function networkDesiredCidrs(mode: string, cidrs: string[]): string[] {
+  if (mode === "public") return [...NETWORK_PUBLIC];
+  const merged = [...NETWORK_CLOSED];
+  for (const cidr of cidrs) if (!merged.includes(cidr)) merged.push(cidr);
+  return merged;
+}
+
+function initialNetworkState(actor = "prewarm") {
+  return {
+    managed: true,
+    mode: "restricted",
+    cidrs: [],
+    desired: [...NETWORK_CLOSED],
+    state: "pending",
+    last_applied_at: null,
+    last_verified_at: null,
+    last_error: "",
+    updated_by: actor,
+  };
+}
+
+function parseNetworkSelection(
+  input: unknown,
+  policy: { allow_public_access: boolean; max_cidrs: number },
+  fallbackMode: "restricted" | "public" = "restricted",
+) {
+  const data = parseObject(input);
+  const mode = data.mode === "public" ? "public" : data.mode === "restricted" ? "restricted" : fallbackMode;
+  const cidrs = normalizeNetworkCidrs(data.cidrs, policy.max_cidrs);
+  if (mode === "public") {
+    if (!policy.allow_public_access) throw new Error("当前资源池不允许公网开放");
+    if (cidrs.length) throw new Error("公网开放模式不需要再填写 CIDR");
+    return { mode, cidrs: [] as string[], desired: [...NETWORK_PUBLIC] };
+  }
+  if (cidrs.some(isPublicCidr)) throw new Error("如需全网开放，请选择 public 模式");
+  return { mode, cidrs, desired: networkDesiredCidrs(mode, cidrs) };
+}
+
+function normalizeWhitelistForCompare(value: unknown): string[] {
+  try {
+    return normalizeNetworkCidrs(value, 64).sort();
+  } catch {
+    return [];
+  }
+}
+
+function sameWhitelist(left: unknown, right: unknown): boolean {
+  const a = normalizeWhitelistForCompare(left);
+  const b = normalizeWhitelistForCompare(right);
+  return a.length === b.length && a.every((item, index) => item === b[index]);
 }
 
 function maskSecret(value: string) {
@@ -729,6 +864,29 @@ class RealAdapter {
     };
   }
 
+  async supabaseWhitelist(instanceName: string) {
+    const data = await this.rdsai("DescribeInstanceIpWhitelist", { InstanceName: instanceName });
+    const raw = data.IpWhiteListGroups?.IpWhiteListGroup || data.IpWhiteListGroups || data.IpWhiteListGroup || [];
+    const groups = (Array.isArray(raw) ? raw : [raw])
+      .filter((item: any) => item && typeof item === "object")
+      .map((item: any) => ({
+        group_name: item.GroupName || "default",
+        cidrs: normalizeNetworkCidrs(item.IpWhitelist || "", 64),
+      }));
+    const primary = groups.find((item: any) => item.group_name === "default") || groups[0] || { cidrs: [] };
+    return { instance_name: instanceName, cidrs: primary.cidrs, groups };
+  }
+
+  async coverSupabaseWhitelist(instanceName: string, cidrs: string[]) {
+    const target = normalizeNetworkCidrs(cidrs, 64);
+    const data = await this.rdsai("ModifyInstanceIpWhitelist", {
+      InstanceName: instanceName,
+      IpWhitelist: target.join(","),
+      ModifyMode: "Cover",
+    });
+    return { instance_name: instanceName, request_id: String(data.RequestId || ""), cidrs: target };
+  }
+
   async supabaseAuthInfo(instanceName: string) {
     const data = await this.rdsai("DescribeInstanceAuthInfo", { InstanceName: instanceName });
     const keys = data.ApiKeys || data.APIKeys || {};
@@ -877,6 +1035,7 @@ class RealAdapter {
 
 class MockAdapter {
   mode = "mock";
+  static mockWhitelists = new Map<string, string[]>();
   constructor(public region: string) {}  async listVpcs() {
     return [{ vpc_id: "vpc-mock-01", name: "Mock VPC", cidr: "172.16.0.0/12", status: "Available", region_id: this.region }];
   }
@@ -919,6 +1078,15 @@ class MockAdapter {
   async deleteSupabase(_instanceName: string) {}
   async supabaseEndpoints(instanceName: string) {
     return { instance_name: instanceName, instance_endpoints: [{ connection_string: "mock.supabase.rds.aliyuncs.com:443", ip: "127.0.0.1", port: "443", ip_type: "Public" }] };
+  }
+  async supabaseWhitelist(instanceName: string) {
+    const cidrs = MockAdapter.mockWhitelists.get(instanceName) || ["0.0.0.0/0"];
+    return { instance_name: instanceName, cidrs: [...cidrs], groups: [{ group_name: "default", cidrs: [...cidrs] }] };
+  }
+  async coverSupabaseWhitelist(instanceName: string, cidrs: string[]) {
+    const target = normalizeNetworkCidrs(cidrs, 64);
+    MockAdapter.mockWhitelists.set(instanceName, target);
+    return { instance_name: instanceName, request_id: `mock-${randomToken(8)}`, cidrs: target };
   }
   async supabaseAuthInfo(instanceName: string) {
     return { instance_name: instanceName, jwt_secret: "mock-secret", api_keys: { anon_key: "mock-anon", service_key: "mock-service" }, config_list: [] };
@@ -969,6 +1137,8 @@ const MOCK_ACTION_MAP: Record<string, [string, string]> = {
   restartSupabase: ["RestartInstance", "RdsAi"],
   deleteSupabase: ["DeleteAppInstance", "RdsAi"],
   supabaseEndpoints: ["DescribeInstanceEndpoints", "RdsAi"],
+  supabaseWhitelist: ["DescribeInstanceIpWhitelist", "RdsAi"],
+  coverSupabaseWhitelist: ["ModifyInstanceIpWhitelist", "RdsAi"],
   supabaseAuthInfo: ["DescribeInstanceAuthInfo", "RdsAi"],
   supabaseResource: ["DescribeAppInstanceResource", "RdsAi"],
   modifySupabaseResource: ["ModifyAppInstanceResource", "RdsAi"],
@@ -1768,6 +1938,143 @@ async function writeAuditEvent(instanceId: string | null, action: string, messag
   }
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function saveNetworkState(inst: any, network: Record<string, any>, fields: Record<string, any> = {}) {
+  const detail = { ...parseObject(inst.detail), network };
+  await setInstance(inst.id, { ...fields, detail: JSON.stringify(detail) });
+  return detail;
+}
+
+async function readInstanceWhitelist(adapter: any, inst: any) {
+  if (!inst?.supabase_instance_id) throw new Error("实例尚未创建 Supabase 资源");
+  return await adapter.supabaseWhitelist(inst.supabase_instance_id);
+}
+
+async function waitForInstanceWhitelist(adapter: any, instanceName: string, target: string[], attempts = 6) {
+  let observed: string[] = [];
+  for (let index = 0; index < attempts; index += 1) {
+    try {
+      observed = (await adapter.supabaseWhitelist(instanceName)).cidrs;
+    } catch (err) {
+      observed = [];
+    }
+    if (sameWhitelist(observed, target)) return observed;
+    if (index + 1 < attempts) await sleep(1000);
+  }
+  throw new Error(`白名单校验失败：期望 ${target.join(",") || "空"}，实际 ${observed.join(",") || "空"}`);
+}
+
+async function coverInstanceNetwork(
+  inst: any,
+  adapter: any,
+  selection: { mode: "restricted" | "public"; cidrs: string[]; desired: string[] },
+  state: "applied" | "closed",
+  actor: string,
+  fields: Record<string, any> = {},
+) {
+  const current = await readInstanceWhitelist(adapter, inst);
+  const target = selection.desired;
+  const network = {
+    managed: true,
+    mode: selection.mode,
+    cidrs: selection.cidrs,
+    desired: target,
+    state: state === "closed" ? "resetting" : "applying",
+    last_applied_at: null,
+    last_verified_at: null,
+    last_error: "",
+    updated_by: actor,
+  };
+  await saveNetworkState(inst, network, fields);
+  try {
+    if (!sameWhitelist(current.cidrs, target)) {
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await adapter.coverSupabaseWhitelist(inst.supabase_instance_id, target);
+          lastError = null;
+          break;
+        } catch (err) {
+          lastError = err;
+          if (attempt < 2) await sleep(1000);
+        }
+      }
+      if (lastError) throw lastError;
+    }
+    const observed = await waitForInstanceWhitelist(adapter, inst.supabase_instance_id, target);
+    const verified = {
+      ...network,
+      desired: target,
+      state,
+      last_applied_at: new Date().toISOString(),
+      last_verified_at: new Date().toISOString(),
+      last_error: "",
+      observed,
+    };
+    const detail = await saveNetworkState(inst, verified, fields);
+    return { network: verified, detail };
+  } catch (err) {
+    await saveNetworkState(inst, { ...network, state: "error", last_error: String(err) }, fields);
+    throw err;
+  }
+}
+
+async function applyClosedNetwork(
+  inst: any,
+  adapter: any,
+  actor: string,
+  fields: Record<string, any> = {},
+  keepSelection = false,
+) {
+  const stored = networkView(parseObject(inst.detail));
+  return await coverInstanceNetwork(
+    inst,
+    adapter,
+    {
+      mode: keepSelection ? stored.mode : "restricted",
+      cidrs: keepSelection ? stored.cidrs : [],
+      desired: [...NETWORK_CLOSED],
+    },
+    "closed",
+    actor,
+    fields,
+  );
+}
+
+async function networkPayload(inst: any, adapter: any) {
+  const stored = networkView(parseObject(inst.detail));
+  const payload: Record<string, any> = { ...stored, observed: null, read_error: "" };
+  if (!inst?.supabase_instance_id) return payload;
+  try {
+    const live = await adapter.supabaseWhitelist(inst.supabase_instance_id);
+    payload.observed = live.cidrs;
+    payload.groups = live.groups;
+  } catch (err) {
+    payload.read_error = String(err);
+  }
+  return payload;
+}
+
+async function changeInstanceNetwork(inst: any, body: Record<string, any>, policy: Record<string, any>, actor: string) {
+  const selection = parseNetworkSelection(body.network !== undefined ? body.network : body, policy);
+  const adapter = cloudAdapter(parseObject(inst.detail).cloud_mode || CLOUD_MODE, inst.region_id);
+  const cloud = await adapter.describeSupabase(inst.supabase_instance_id);
+  if (String(cloud.status) !== "Running") {
+    throw new Error(`实例当前状态为 ${cloud.status || "未知"}，仅 Running 状态可以修改白名单`);
+  }
+  const applied = await coverInstanceNetwork(inst, adapter, selection, "applied", actor);
+  await writeAuditEvent(inst.id, "network_update", `更新网络白名单：${selection.mode}`, {
+    mode: selection.mode,
+    cidrs: selection.cidrs,
+    desired: selection.desired,
+    actor,
+  });
+  return { ...applied.network, observed: applied.network.observed || selection.desired };
+}
+
 async function preflightPayload() {
   if (CLOUD_MODE !== "real") {
     const checks = [
@@ -2005,9 +2312,9 @@ async function scheduleTask(task: any, step: string, progress: number, message: 
   await sql`update tasks set next_run_at = now() + make_interval(secs => ${seconds}) where id = ${task.id}`;
 }
 
-async function failTask(task: any, error: string) {
+async function failTask(task: any, error: string, terminal = false) {
   const attempts = Number(task.attempts || 0) + 1;
-  if (attempts >= 3) {
+  if (terminal || attempts >= 3) {
     await updateTask(task, {
       status: "failed",
       attempts,
@@ -2098,8 +2405,43 @@ async function processPrewarm(task: any, inst: any) {
     const data = await adapter.describeSupabase(inst.supabase_instance_id);
     if (data.status !== "Running") return scheduleTask(task, "wait_supabase", 60, "等待 Supabase Running", 10);
     const cloudDetail = { ...detail, cloud: data };
-    await setInstance(inst.id, { status: "Available", detail: JSON.stringify(cloudDetail), error: null });
-    return scheduleTask(task, "stop_supabase", 75, "冻结进入冷池", 1);
+    await setInstance(inst.id, { detail: JSON.stringify(cloudDetail), error: null });
+    return scheduleTask(task, "close_network", 70, "关闭公网白名单", 1);
+  }
+  if (step === "close_network") {
+    try {
+      const applied = await applyClosedNetwork(inst, adapter, "prewarm");
+      await writeAuditEvent(inst.id, "network_close", "预热关闭白名单", { desired: NETWORK_CLOSED });
+      await setInstance(inst.id, {
+        detail: JSON.stringify({ ...parseObject(applied.detail), cloud: detail.cloud }),
+        error: null,
+      });
+      return scheduleTask(task, "wait_network", 74, "等待网络配置完成", 3);
+    } catch (err) {
+      const message = `预热关闭白名单失败：${String(err)}`;
+      await saveNetworkState(inst, { ...networkView(parseObject(inst.detail)), state: "error", last_error: String(err) }, {
+        status: "Failed",
+        error: message,
+      });
+      try {
+        await adapter.stopSupabase(inst.supabase_instance_id, config.stop_mode === "force");
+        await setInstance(inst.id, { cloud_status: "Stopped" });
+      } catch {
+        // keep the original failure; the instance is not offered to users
+      }
+      await failTask(task, message, true);
+      return;
+    }
+  }
+  if (step === "wait_network") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status !== "Running") return scheduleTask(task, "wait_network", 76, `等待网络配置完成（${data.status}）`, 5);
+    await setInstance(inst.id, {
+      status: "Available",
+      detail: JSON.stringify({ ...parseObject(inst.detail), cloud: data }),
+      error: null,
+    });
+    return scheduleTask(task, "stop_supabase", 78, "冻结进入冷池", 1);
   }
   if (step === "stop_supabase") {
     await adapter.stopSupabase(inst.supabase_instance_id, config.stop_mode === "force");
@@ -2204,12 +2546,15 @@ async function processAllocate(task: any, inst: any) {
   const payload = parseObject(task.payload);
   const adapter = cloudAdapter(payload.cloud_mode || CLOUD_MODE, inst.region_id);
   const step = task.step || "start";
-  if (inst.status === "Available" || !inst.supabase_instance_id) {
+  if (!inst.supabase_instance_id) {
     await setInstance(inst.id, { status: "InUse", error: null });
     await finishTask(task, { instance_id: inst.id, status: "InUse" });
     return;
   }
   if (step === "start") {
+    if (inst.status === "Available" || inst.cloud_status === "Running") {
+      return scheduleTask(task, "apply_network", 40, "应用白名单", 1);
+    }
     await adapter.startSupabase(inst.supabase_instance_id);
     return scheduleTask(task, "wait_running", 40, "等待实例 Running", 5);
   }
@@ -2217,12 +2562,61 @@ async function processAllocate(task: any, inst: any) {
     const data = await adapter.describeSupabase(inst.supabase_instance_id);
     if (data.status !== "Running") return scheduleTask(task, "wait_running", 70, "等待实例 Running", 8);
     await setInstance(inst.id, {
-      status: "InUse",
-      error: null,
       cloud_status: "Running",
       detail: JSON.stringify({ ...parseObject(inst.detail), cloud: data }),
     });
-    await finishTask(task, { instance_id: inst.id, status: "InUse" });
+    return scheduleTask(task, "apply_network", 80, "应用白名单", 1);
+  }
+  if (step === "apply_network") {
+    const poolRows = await sql`select config from pools where id = ${inst.pool_id} limit 1`;
+    const policy = networkPolicy(poolConfig(poolRows[0]?.config));
+    let selection;
+    try {
+      selection = parseNetworkSelection(payload.network, policy);
+    } catch (err) {
+      await failTask(task, `白名单参数无效：${String(err)}`, true);
+      return;
+    }
+    try {
+      const applied = await coverInstanceNetwork(inst, adapter, selection, "applied", String(payload.actor || "allocate"));
+      await writeAuditEvent(inst.id, "network_apply", `分配时应用白名单：${selection.mode}`, {
+        mode: selection.mode,
+        cidrs: selection.cidrs,
+        desired: selection.desired,
+      });
+      const pendingNetwork = { ...applied.network, state: "applying" };
+      await saveNetworkState(inst, pendingNetwork, {
+        status: "InUse",
+        error: null,
+        cloud_status: "Running",
+      });
+      return scheduleTask(task, "wait_network", 90, "等待网络配置完成", 3);
+    } catch (err) {
+      const message = `分配应用白名单失败：${String(err)}`;
+      await saveNetworkState(inst, { ...networkView(parseObject(inst.detail)), state: "error", last_error: String(err) }, {
+        error: message,
+      });
+      try {
+        await adapter.stopSupabase(inst.supabase_instance_id, false);
+        await setInstance(inst.id, { status: "Failed", cloud_status: "Stopped" });
+      } catch {
+        await setInstance(inst.id, { status: "Failed" });
+      }
+      await failTask(task, message, true);
+    }
+  }
+  if (step === "wait_network") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status !== "Running") return scheduleTask(task, "wait_network", 93, `等待网络配置完成（${data.status}）`, 5);
+    const detail = parseObject(inst.detail);
+    const network = { ...networkView(detail), state: "applied", last_verified_at: new Date().toISOString() };
+    await setInstance(inst.id, {
+      status: "InUse",
+      error: null,
+      cloud_status: "Running",
+      detail: JSON.stringify({ ...detail, network, cloud: data }),
+    });
+    await finishTask(task, { instance_id: inst.id, status: "InUse", network });
   }
 }
 
@@ -2244,6 +2638,35 @@ async function processRelease(task: any, inst: any) {
     return;
   }
   if (step === "stop") {
+    return scheduleTask(task, "reset_network", 35, "重置白名单", 1);
+  }
+  if (step === "reset_network") {
+    if (!inst.supabase_instance_id) return scheduleTask(task, "stop_supabase", 50, "停止实例", 1);
+    try {
+      await applyClosedNetwork(inst, adapter, "release", {}, true);
+      await writeAuditEvent(inst.id, "network_reset", "归还时重置白名单", { desired: NETWORK_CLOSED });
+      return scheduleTask(task, "wait_network", 45, "等待网络配置完成", 3);
+    } catch (err) {
+      const message = `归还重置白名单失败：${String(err)}`;
+      await saveNetworkState(inst, { ...networkView(parseObject(inst.detail)), state: "error", last_error: String(err) }, {
+        error: message,
+      });
+      try {
+        await adapter.stopSupabase(inst.supabase_instance_id, false);
+        await setInstance(inst.id, { status: "Failed", cloud_status: "Stopped" });
+      } catch {
+        await setInstance(inst.id, { status: "Failed" });
+      }
+      await failTask(task, message, true);
+      return;
+    }
+  }
+  if (step === "wait_network") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status !== "Running") return scheduleTask(task, "wait_network", 48, `等待网络配置完成（${data.status}）`, 5);
+    return scheduleTask(task, "stop_supabase", 50, "停止实例", 1);
+  }
+  if (step === "stop_supabase") {
     if (inst.supabase_instance_id) await adapter.stopSupabase(inst.supabase_instance_id, false);
     return scheduleTask(task, "wait_stopped", 60, "等待实例停止", 5);
   }
@@ -2265,11 +2688,16 @@ const DEFAULT_POOL_CONFIG = {
   single_pg_class: "pg.n2.2c.1m", single_pg_storage: 20, single_pg_category: "Basic",
   single_engine_version: "17.0", single_pg_security_ips: "127.0.0.1", public_endpoint_enabled: true,
   shared_pg_class: "pg.n2.2c.2m", shared_pg_storage: 20, shared_pg_category: "HighAvailability",
-  shared_pg_engine_version: "18.0",
+  shared_pg_engine_version: "18.0", network_policy: DEFAULT_NETWORK_POLICY,
 };
 
 function poolConfig(value: unknown): Record<string, any> {
-  return { ...DEFAULT_POOL_CONFIG, ...parseObject(value) };
+  const config = parseObject(value);
+  return {
+    ...DEFAULT_POOL_CONFIG,
+    ...config,
+    network_policy: { ...DEFAULT_NETWORK_POLICY, ...parseObject(config.network_policy) },
+  };
 }
 
 async function regionView(regionId: string) {
@@ -2363,20 +2791,123 @@ async function processAction(task: any, inst: any) {
   const action = String(payload.action || task.kind);
   const step = task.step || "run";
   if (step === "run") {
-    if (action === "start") await adapter.startSupabase(inst.supabase_instance_id);
-    else if (action === "stop") await adapter.stopSupabase(inst.supabase_instance_id, !!payload.force);
-    else if (action === "restart") await adapter.restartSupabase(inst.supabase_instance_id);
+    if (action === "stop") {
+      if (inst.cloud_status === "Stopped") {
+        await setInstance(inst.id, { status: "InCold", cloud_status: "Stopped" });
+        await finishTask(task, { instance_id: inst.id, action });
+        return;
+      }
+      return scheduleTask(task, "reset_network", 30, "重置白名单", 1);
+    }
+    if (action === "start") {
+      await adapter.startSupabase(inst.supabase_instance_id);
+      return scheduleTask(task, "wait", 50, "等待启动完成", 5);
+    }
+    if (action === "restart") {
+      await adapter.restartSupabase(inst.supabase_instance_id);
+      return scheduleTask(task, "wait", 50, "等待重启完成", 5);
+    }
     return scheduleTask(task, "wait", 50, `等待${action}完成`, 5);
   }
-  if (step === "wait" && adapter.mode === "real") {
-    const data = await adapter.describeSupabase(inst.supabase_instance_id);
-    const expected = action === "stop" ? "Stopped" : "Running";
-    if (data.status !== expected) return scheduleTask(task, "wait", 70, `等待${action}完成`, 8);
+  if (step === "reset_network") {
+    try {
+      await applyClosedNetwork(inst, adapter, "admin_action", {}, true);
+      await writeAuditEvent(inst.id, "network_reset", "手动停止前重置白名单", { desired: NETWORK_CLOSED });
+      return scheduleTask(task, "wait_network", 45, "等待网络配置完成", 3);
+    } catch (err) {
+      const message = `停止前重置白名单失败：${String(err)}`;
+      await saveNetworkState(inst, { ...networkView(parseObject(inst.detail)), state: "error", last_error: String(err) }, {
+        error: message,
+      });
+      try {
+        await adapter.stopSupabase(inst.supabase_instance_id, !!payload.force);
+        await setInstance(inst.id, { status: "Failed", cloud_status: "Stopped" });
+      } catch {
+        await setInstance(inst.id, { status: "Failed" });
+      }
+      await failTask(task, message, true);
+      return;
+    }
   }
-  if (action === "stop") {
-    await setInstance(inst.id, { status: inst.bound_app_id ? "InCold" : "InCold", cloud_status: "Stopped" });
-  } else if (action === "start") {
-    await setInstance(inst.id, { status: inst.bound_app_id ? "InUse" : "Available", cloud_status: "Running" });
+  if (step === "stop_instance") {
+    await adapter.stopSupabase(inst.supabase_instance_id, !!payload.force);
+    return scheduleTask(task, "wait_stopped", 75, "等待实例停止", 5);
+  }
+  if (step === "wait") {
+    if (action === "start" || action === "restart") {
+      const data = await adapter.describeSupabase(inst.supabase_instance_id);
+      if (data.status !== "Running") return scheduleTask(task, "wait", 70, `等待${action}完成`, 8);
+      await setInstance(inst.id, { cloud_status: "Running", detail: JSON.stringify({ ...parseObject(inst.detail), cloud: data }) });
+      return scheduleTask(task, "apply_action_network", 85, "应用白名单", 1);
+    }
+    await finishTask(task, { instance_id: inst.id, action });
+    return;
+  }
+  if (step === "apply_action_network") {
+    const stored = networkView(parseObject(inst.detail));
+    const reopen = inst.status === "InUse" && !!inst.bound_app_id && stored.managed;
+    let selection;
+    try {
+      selection = reopen
+        ? { mode: stored.mode, cidrs: stored.cidrs, desired: networkDesiredCidrs(stored.mode, stored.cidrs) }
+        : { mode: "restricted" as const, cidrs: [] as string[], desired: [...NETWORK_CLOSED] };
+      const applied = await coverInstanceNetwork(
+        inst,
+        adapter,
+        selection,
+        reopen ? "applied" : "closed",
+        "admin_action",
+      );
+      await writeAuditEvent(inst.id, "network_apply", `手动${action}后应用白名单`, {
+        mode: selection.mode,
+        cidrs: selection.cidrs,
+        desired: selection.desired,
+      });
+      await saveNetworkState(inst, { ...applied.network, state: reopen ? "applying" : "closed" }, {
+        cloud_status: "Running",
+        error: null,
+      });
+      return scheduleTask(task, "wait_network", 92, "等待网络配置完成", 3);
+    } catch (err) {
+      const message = `手动${action}应用白名单失败：${String(err)}`;
+      await saveNetworkState(inst, { ...networkView(parseObject(inst.detail)), state: "error", last_error: String(err) }, {
+        error: message,
+      });
+      try {
+        await adapter.stopSupabase(inst.supabase_instance_id, !!payload.force);
+        await setInstance(inst.id, { status: "Failed", cloud_status: "Stopped" });
+      } catch {
+        await setInstance(inst.id, { status: "Failed" });
+      }
+      await failTask(task, message, true);
+      return;
+    }
+  }
+  if (step === "wait_network") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status !== "Running") return scheduleTask(task, "wait_network", 94, `等待网络配置完成（${data.status}）`, 5);
+    if (action === "stop") return scheduleTask(task, "stop_instance", 55, "停止实例", 1);
+    const detail = parseObject(inst.detail);
+    const stored = networkView(detail);
+    const network = stored.state === "applying" ? { ...stored, state: "applied", last_verified_at: new Date().toISOString() } : stored;
+    const nextStatus = action === "start" ? (inst.owner_user_id ? "InUse" : "Available") : inst.status;
+    await setInstance(inst.id, {
+      status: nextStatus,
+      cloud_status: "Running",
+      detail: JSON.stringify({ ...detail, network, cloud: data }),
+      error: null,
+    });
+    await finishTask(task, { instance_id: inst.id, action });
+    return;
+  }
+  if (step === "wait_stopped") {
+    if (adapter.mode === "real") {
+      const data = await adapter.describeSupabase(inst.supabase_instance_id);
+      if (data.status !== "Stopped") return scheduleTask(task, "wait_stopped", 85, "等待实例停止", 8);
+    }
+    await setInstance(inst.id, { status: "InCold", cloud_status: "Stopped" });
+    await finishTask(task, { instance_id: inst.id, action });
+    return;
   }
   await finishTask(task, { instance_id: inst.id, action });
 }
@@ -2386,7 +2917,7 @@ async function enqueuePrewarm(pool: any, count: number): Promise<string[]> {
   for (let index = 0; index < count; index += 1) {
     const instanceId = randomId();
     const appName = `pool-${pool.mode}-${randomToken(4)}`;
-    const detail = { source: "edge-auto-prewarm", cloud_mode: CLOUD_MODE, pool_id: pool.id };
+    const detail = { source: "edge-auto-prewarm", cloud_mode: CLOUD_MODE, pool_id: pool.id, network: initialNetworkState() };
     await sql`
       insert into pool_instances (id, mode, pool_id, status, app_name, region_id, vpc_id, vswitch_id, instance_class, detail, is_deleted, created_at, updated_at)
       values (${instanceId}, ${pool.mode}, ${pool.id}, 'Creating', ${appName}, ${pool.region_id}, ${pool.vpc_id}, ${pool.vswitch_id},
@@ -3360,7 +3891,7 @@ async function handler(req: Request): Promise<Response> {
       for (let index = 0; index < count; index += 1) {
         const instanceId = randomId();
         const appName = `pool-${pool.mode}-${randomToken(4)}`;
-        const detail = { source: "edge-prewarm", cloud_mode: CLOUD_MODE, pool_id: pool.id };
+        const detail = { source: "edge-prewarm", cloud_mode: CLOUD_MODE, pool_id: pool.id, network: initialNetworkState() };
         await sql`
           insert into pool_instances (id, mode, pool_id, status, app_name, region_id, vpc_id, vswitch_id, instance_class, detail, is_deleted, created_at, updated_at)
           values (${instanceId}, ${pool.mode}, ${pool.id}, 'Creating', ${appName}, ${pool.region_id}, ${pool.vpc_id}, ${pool.vswitch_id},
@@ -3394,6 +3925,16 @@ async function handler(req: Request): Promise<Response> {
       const poolRows = await sql`select * from pools where region_id = ${regionId} and mode = ${mode} and enabled = true limit 1`;
       const pool: any = poolRows[0];
       if (!pool) return error("资源池不存在");
+      const policy = networkPolicy(poolConfig(pool.config));
+      if (!policy.allow_user_edit && body.network !== undefined) {
+        return error("管理员未开放使用者配置网络白名单");
+      }
+      let selection;
+      try {
+        selection = parseNetworkSelection(body.network, policy);
+      } catch (err) {
+        return error(String(err));
+      }
       const active = await sql`
         select * from pool_instances
         where owner_user_id = ${ctx!.user.id} and is_deleted = false
@@ -3411,7 +3952,18 @@ async function handler(req: Request): Promise<Response> {
       `;
       const instance: any = candidates[0];
       if (!instance) return error("该地域冷池暂无可用实例，请联系管理员预热", 409);
-      const detail = { ...parseObject(instance.detail), bound_app_name: appName };
+      const initialNetwork = {
+        managed: true,
+        mode: selection.mode,
+        cidrs: selection.cidrs,
+        desired: selection.desired,
+        state: "pending",
+        last_applied_at: null,
+        last_verified_at: null,
+        last_error: "",
+        updated_by: ctx!.user.username,
+      };
+      const detail = { ...parseObject(instance.detail), bound_app_name: appName, network: initialNetwork };
       await setInstance(instance.id, {
         status: "InUse",
         owner_user_id: ctx!.user.id,
@@ -3424,10 +3976,10 @@ async function handler(req: Request): Promise<Response> {
       await sql`
         insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
         values (${taskId}, 'allocate', ${mode}, ${pool.id}, ${instance.id}, ${`分配 ${appName}`}, 'pending', 0, '等待 worker',
-                ${JSON.stringify({ instance_id: instance.id, cloud_mode: detail.cloud_mode || CLOUD_MODE, app_name: appName })}::json, '{}'::json, 'start', 0, now())
+                ${JSON.stringify({ instance_id: instance.id, cloud_mode: detail.cloud_mode || CLOUD_MODE, app_name: appName, network: selection, actor: ctx!.user.username })}::json, '{}'::json, 'start', 0, now())
       `;
-      await writeAuditEvent(instance.id, "allocate", `分配给应用 ${appName}`, { app_name: appName, user: ctx!.user.username });
-      return json({ task_id: taskId, instance_id: instance.id, app_name: appName, region_id: regionId });
+      await writeAuditEvent(instance.id, "allocate", `分配给应用 ${appName}`, { app_name: appName, user: ctx!.user.username, network: selection });
+      return json({ task_id: taskId, instance_id: instance.id, app_name: appName, region_id: regionId, network: selection });
     }
 
     if (/^\/api\/(v1\/)?portal\/instances\/[^/]+\/release$/.test(path) && method === "POST") {
@@ -3443,7 +3995,7 @@ async function handler(req: Request): Promise<Response> {
       await sql`
         insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
         values (${taskId}, 'release', ${inst.mode}, ${inst.pool_id}, ${inst.id}, ${`归还 ${inst.app_name}`}, 'pending', 0, '等待 worker',
-                ${JSON.stringify({ instance_id: inst.id, cloud_mode: parseObject(inst.detail).cloud_mode || CLOUD_MODE, destroy: false })}::json, '{}'::json, 'stop', 0, now())
+                ${JSON.stringify({ instance_id: inst.id, cloud_mode: parseObject(inst.detail).cloud_mode || CLOUD_MODE, destroy: false, actor: ctx!.user.username })}::json, '{}'::json, 'reset_network', 0, now())
       `;
       await writeAuditEvent(inst.id, "release", "使用者归还实例", { destroy: false, user: ctx!.user.username });
       return json({ task_id: taskId, destroy: false });
@@ -3526,6 +4078,7 @@ async function handler(req: Request): Promise<Response> {
       const pool: any = rows[0];
       if (!pool) return error("资源池不存在", 404);
       const nextConfig = poolConfig(body.config !== undefined ? body.config : pool.config);
+      nextConfig.network_policy = networkPolicy(nextConfig);
       if (Number(nextConfig.target) > Number(nextConfig.max)) return error("目标水位不能大于最大实例数");
       await sql`
         update pools set
@@ -4238,6 +4791,32 @@ async function handler(req: Request): Promise<Response> {
       return json({ task_id: taskId, action });
     }
 
+    if (/^\/api\/instances\/[^/]+\/network$/.test(path) && method === "GET") {
+      if (!(await requireAdmin(req))) return error("需要管理员权限", 403);
+      const id = path.split("/").slice(-2)[0];
+      const { inst, adapter } = await instanceCloud(id);
+      if (!inst) return error("实例不存在", 404);
+      if (!inst.supabase_instance_id) return error("实例尚未创建 Supabase 资源", 404);
+      return json(await networkPayload(inst, adapter));
+    }
+
+    if (/^\/api\/instances\/[^/]+\/network$/.test(path) && method === "PATCH") {
+      const ctx = await requireAdmin(req);
+      if (!ctx) return error("需要管理员权限", 403);
+      const id = path.split("/").slice(-2)[0];
+      const rows = await sql`select * from pool_instances where id = ${id} and is_deleted = false limit 1`;
+      const inst: any = rows[0];
+      if (!inst) return error("实例不存在", 404);
+      if (!inst.supabase_instance_id) return error("实例尚未创建 Supabase 资源", 404);
+      const poolRows = inst.pool_id ? await sql`select config from pools where id = ${inst.pool_id} limit 1` : [];
+      const policy = { ...networkPolicy(poolConfig(poolRows[0]?.config)), allow_public_access: true };
+      try {
+        return json(await changeInstanceNetwork(inst, await req.json(), policy, `admin:${ctx.user.username}`));
+      } catch (err) {
+        return error(String(err), 400);
+      }
+    }
+
     if (/^\/api\/instances\/[^/]+\/endpoints$/.test(path) && method === "GET") {
       if (!(await requireAdmin(req))) return error("需要管理员权限", 403);
       const id = path.split("/").slice(-2)[0];
@@ -4313,7 +4892,29 @@ async function handler(req: Request): Promise<Response> {
       if (!["Available", "InCold"].includes(inst.status)) return error(`实例当前状态为 ${inst.status}，不可分配`);
       const reservedApp = String(detail.reserved_app_name || "");
       if (reservedApp && reservedApp !== appName) return error(`该实例保留给应用 ${reservedApp}，不能分配给其他应用`);
-      const nextDetail = { ...detail, bound_app_name: appName };
+      const poolRows = inst.pool_id ? await sql`select config from pools where id = ${inst.pool_id} limit 1` : [];
+      const policy = { ...networkPolicy(poolConfig(poolRows[0]?.config)), allow_public_access: true };
+      let selection;
+      try {
+        selection = parseNetworkSelection(body.network, policy);
+      } catch (err) {
+        return error(String(err));
+      }
+      const nextDetail = {
+        ...detail,
+        bound_app_name: appName,
+        network: {
+          managed: true,
+          mode: selection.mode,
+          cidrs: selection.cidrs,
+          desired: selection.desired,
+          state: "pending",
+          last_applied_at: null,
+          last_verified_at: null,
+          last_error: "",
+          updated_by: "admin",
+        },
+      };
       delete nextDetail.reserved;
       delete nextDetail.reserved_app_name;
       delete nextDetail.reserved_user_id;
@@ -4329,10 +4930,10 @@ async function handler(req: Request): Promise<Response> {
       await sql`
         insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
         values (${taskId}, 'allocate', ${inst.mode}, ${inst.pool_id}, ${inst.id}, ${`分配 ${inst.app_name} → ${appName}`}, 'pending', 0, '等待 worker',
-                ${JSON.stringify({ instance_id: inst.id, cloud_mode: detail.cloud_mode || CLOUD_MODE, app_name: appName, need_start: inst.status === "InCold" })}::json, '{}'::json, 'start', 0, now())
+                ${JSON.stringify({ instance_id: inst.id, cloud_mode: detail.cloud_mode || CLOUD_MODE, app_name: appName, need_start: inst.status === "InCold", network: selection, actor: "admin" })}::json, '{}'::json, 'start', 0, now())
       `;
-      await writeAuditEvent(inst.id, "allocate", `分配给应用 ${appName}`, { app_name: appName, user: String(body.user || "").trim() });
-      return json({ task_id: taskId, instance_id: inst.id, bound_app_id: boundAppId, app_name: appName });
+      await writeAuditEvent(inst.id, "allocate", `分配给应用 ${appName}`, { app_name: appName, user: String(body.user || "").trim(), network: selection });
+      return json({ task_id: taskId, instance_id: inst.id, bound_app_id: boundAppId, app_name: appName, network: selection });
     }
 
     if (/^\/api\/instances\/[^/]+\/release$/.test(path) && method === "POST") {
@@ -4358,10 +4959,42 @@ async function handler(req: Request): Promise<Response> {
       await sql`
         insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
         values (${taskId}, 'release', ${inst.mode}, ${inst.pool_id}, ${inst.id}, ${`${destroy ? "删除" : "保留"} ${inst.app_name}`}, 'pending', 0, '等待 worker',
-                ${JSON.stringify({ instance_id: inst.id, cloud_mode: detail.cloud_mode || CLOUD_MODE, destroy })}::json, '{}'::json, ${destroy ? "delete_supabase" : "stop"}, 0, now())
+                ${JSON.stringify({ instance_id: inst.id, cloud_mode: detail.cloud_mode || CLOUD_MODE, destroy, actor: "admin" })}::json, '{}'::json, ${destroy ? "delete_supabase" : "reset_network"}, 0, now())
       `;
       await writeAuditEvent(inst.id, "release", destroy ? "删除实例资源" : "保留给原应用复用", { destroy });
       return json({ task_id: taskId, destroy });
+    }
+
+    if (/^\/api\/(v1\/)?portal\/instances\/[^/]+\/network$/.test(path) && method === "GET") {
+      const ctx = await authenticate(req);
+      if (!hasScope(ctx, "network:read")) return error("API Token 缺少 network:read 权限", 403);
+      const id = path.split("/").slice(-2)[0];
+      const rows = await sql`select * from pool_instances where id = ${id} and owner_user_id = ${ctx!.user.id} and is_deleted = false limit 1`;
+      const inst: any = rows[0];
+      if (!inst) return error("实例不存在或不属于当前用户", 404);
+      if (!inst.supabase_instance_id) return error("实例尚未创建 Supabase 资源", 404);
+      const detail = parseObject(inst.detail);
+      const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
+      return json(await networkPayload(inst, adapter));
+    }
+
+    if (/^\/api\/(v1\/)?portal\/instances\/[^/]+\/network$/.test(path) && method === "PATCH") {
+      const ctx = await authenticate(req);
+      if (!hasScope(ctx, "network:write")) return error("API Token 缺少 network:write 权限", 403);
+      const id = path.split("/").slice(-2)[0];
+      const rows = await sql`select * from pool_instances where id = ${id} and owner_user_id = ${ctx!.user.id} and is_deleted = false limit 1`;
+      const inst: any = rows[0];
+      if (!inst) return error("实例不存在或不属于当前用户", 404);
+      if (inst.status !== "InUse") return error(`实例当前状态为 ${inst.status}，不可修改白名单`, 409);
+      if (!inst.supabase_instance_id) return error("实例尚未创建 Supabase 资源", 404);
+      const poolRows = inst.pool_id ? await sql`select config from pools where id = ${inst.pool_id} limit 1` : [];
+      const policy = networkPolicy(poolConfig(poolRows[0]?.config));
+      if (!policy.allow_user_edit) return error("管理员未开放使用者配置网络白名单", 403);
+      try {
+        return json(await changeInstanceNetwork(inst, await req.json(), policy, ctx!.user.username));
+      } catch (err) {
+        return error(String(err), 400);
+      }
     }
 
     if (/^\/api\/(v1\/)?portal\/instances\/[^/]+\/endpoints$/.test(path) && method === "GET") {
@@ -4371,9 +5004,14 @@ async function handler(req: Request): Promise<Response> {
       const rows = await sql`select * from pool_instances where id = ${id} and owner_user_id = ${ctx!.user.id} and is_deleted = false limit 1`;
       const inst: any = rows[0];
       if (!inst?.supabase_instance_id) return error("实例不存在或尚未创建 Supabase 资源", 404);
+      if (inst.status !== "InUse") return error("实例尚未进入使用状态", 409);
       const detail = parseObject(inst.detail);
+      const network = networkView(detail);
+      if (network.managed && network.state !== "applied") {
+        return error(`网络白名单尚未就绪（${network.state}）`, 409);
+      }
       const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
-      return json(await adapter.supabaseEndpoints(inst.supabase_instance_id));
+      return json({ ...(await adapter.supabaseEndpoints(inst.supabase_instance_id)), network });
     }
 
     if (/^\/api\/(v1\/)?portal\/instances\/[^/]+\/auth-info$/.test(path) && method === "GET") {
@@ -4383,7 +5021,12 @@ async function handler(req: Request): Promise<Response> {
       const rows = await sql`select * from pool_instances where id = ${id} and owner_user_id = ${ctx!.user.id} and is_deleted = false limit 1`;
       const inst: any = rows[0];
       if (!inst?.supabase_instance_id) return error("实例不存在或尚未创建 Supabase 资源", 404);
+      if (inst.status !== "InUse") return error("实例尚未进入使用状态", 409);
       const detail = parseObject(inst.detail);
+      const network = networkView(detail);
+      if (network.managed && network.state !== "applied") {
+        return error(`网络白名单尚未就绪（${network.state}）`, 409);
+      }
       const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
       return json(await adapter.supabaseAuthInfo(inst.supabase_instance_id));
     }

@@ -8,6 +8,7 @@ import type {
   EndpointsInfo,
   GlobalOverview,
   Instance,
+  InstanceNetwork,
   MetaInfo,
   MetadataStatus,
   Overview,
@@ -96,11 +97,26 @@ export const api = {
     }),
 
   portalOverview: () => request<PortalOverview>("/portal/overview"),
-  portalApply: (body: { region_id: string; app_name: string; mode: "single" | "shared" }) =>
-    request<{ task_id: string; instance_id: string; bound_app_id: string; app_name: string; region_id: string }>(
-      "/portal/instances/apply",
-      { method: "POST", body: JSON.stringify(body) },
-    ),
+  portalApply: (body: {
+    region_id: string;
+    app_name: string;
+    mode: "single" | "shared";
+    network?: { mode: "restricted" | "public"; cidrs?: string[] };
+  }) =>
+    request<{
+      task_id: string;
+      instance_id: string;
+      bound_app_id: string;
+      app_name: string;
+      region_id: string;
+      network: { mode: "restricted" | "public"; cidrs: string[]; desired: string[] };
+    }>("/portal/instances/apply", { method: "POST", body: JSON.stringify(body) }),
+  portalNetwork: (id: string) => request<InstanceNetwork>(`/portal/instances/${id}/network`),
+  updatePortalNetwork: (id: string, body: { mode: "restricted" | "public"; cidrs?: string[] }) =>
+    request<InstanceNetwork>(`/portal/instances/${id}/network`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
   portalTokens: () => request<{ tokens: PlatformToken[]; scopes: string[] }>("/portal/tokens"),
   createPortalToken: (body: { name: string; scopes: string[]; expires_in_days: number }) =>
     request<PlatformToken & { token: string }>("/portal/tokens", { method: "POST", body: JSON.stringify(body) }),
@@ -225,6 +241,9 @@ export const api = {
       body: JSON.stringify({ action, force }),
     }),
   destroy: (id: string) => request<{ task_id: string }>(`/instances/${id}`, { method: "DELETE" }),
+  network: (id: string) => request<InstanceNetwork>(`/instances/${id}/network`),
+  updateNetwork: (id: string, body: { mode: "restricted" | "public"; cidrs?: string[] }) =>
+    request<InstanceNetwork>(`/instances/${id}/network`, { method: "PATCH", body: JSON.stringify(body) }),
   endpoints: (id: string) => request<EndpointsInfo>(`/instances/${id}/endpoints`),
   authInfo: (id: string) => request<AuthInfo>(`/instances/${id}/auth-info`),
   resource: (id: string) => request<ResourceInfo>(`/instances/${id}/resource`),

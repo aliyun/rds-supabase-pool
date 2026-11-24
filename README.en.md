@@ -51,7 +51,7 @@ Prerequisites:
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.0"
+export POOL_UI_RELEASE_TAG="v0.1.1"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<strong-password>"
@@ -67,7 +67,7 @@ export DINGTALK_SECRET="SEC..."   # required only for a signed robot
 ./edge/bootstrap.sh
 ```
 
-> Release mode requires `pool-ui-v0.1.0.ts` and its `.sha256` to be uploaded to the corresponding GitHub Release.
+> Release mode requires `pool-ui-v0.1.1.ts` and its `.sha256` to be uploaded to the corresponding GitHub Release.
 > For development or before a release exists, use `DEPLOY_UI=source ./edge/bootstrap.sh` (requires Node/npm).
 > To update the API only, use `DEPLOY_UI=0 ./edge/bootstrap.sh`.
 
@@ -114,11 +114,15 @@ Create a PAT in the portal, then:
 python3 -m pip install -e cli
 poolctl login --url https://<domain>/functions/v1/pool-api --token pctl_xxx
 poolctl regions
-poolctl apply --region cn-hangzhou --mode shared --app my-app --wait
+poolctl apply --region cn-hangzhou --mode shared --app my-app \
+  --allow-cidr 203.0.113.10/32 --wait
 poolctl connect my-app --env
+poolctl network my-app
 poolctl release my-app --yes --wait
 ```
 
+Use `--public` for all-Internet access when the pool policy allows it. Cold
+instances and returns reset the Supabase instance allowlist to `127.0.0.1`.
 See [docs/api.md](docs/api.md).
 
 ## Monitoring and alerts

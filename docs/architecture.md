@@ -125,11 +125,19 @@ pg_cron（每分钟）
 ### 实例生命周期
 
 ```text
-预热 Creating → Available → stop → InCold
-申请：InCold → start → InUse
-归还：InUse → stop → InCold（保留给同名应用）
+预热 Creating → wait_running → close_network → stop → InCold
+申请：InCold/Available → start（如需要）→ wait_running → apply_network → InUse
+归还：InUse → reset_network（Cover 127.0.0.1）→ stop → InCold（保留给同名应用）
 删除：InCold/InUse → delete_supabase → Deleted
 ```
+
+Supabase 实例网络白名单由任务状态机维护：
+
+- 冷池统一 `127.0.0.1`。
+- 分配时按使用者选择的 `restricted`/`public` 模式 Cover 目标白名单。
+- 归还时先 Cover 回 `127.0.0.1` 并读取校验，再停止实例。
+- Stopped 状态不能修改白名单，因此所有写入都必须在 Running 窗口完成。
+- 详细状态和失败处理见 `docs/api.md`。
 
 真实模式下由 RealAdapter 调用 RDS / RdsAi；Mock 模式只写控制库并返回模拟资源。
 
@@ -138,7 +146,7 @@ pg_cron（每分钟）
 - 平台用户：`admin` / `user`
 - 浏览器使用 JWT Cookie
 - 使用者 API / CLI 使用 PAT（`pctl_...`）
-- PAT 有 scope：`instances:read/apply/release`、`credentials:read`
+- PAT 有 scope：`instances:read/apply/release`、`credentials:read`、`network:read/write`
 - 管理端接口要求 JWT 管理员，PAT 不能访问
 - 使用者只能申请/归还，不能删除实例
 - 所有真实云写操作由管理员或任务 worker 执行

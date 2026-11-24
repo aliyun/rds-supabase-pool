@@ -199,12 +199,15 @@ def cmd_apps(args: argparse.Namespace) -> None:
 
 
 def cmd_apply(args: argparse.Namespace) -> None:
-    payload = api(
-        args,
-        "POST",
-        "/api/v1/portal/instances/apply",
-        {"region_id": args.region, "app_name": args.app, "mode": args.mode},
-    )
+    network = None
+    if args.public:
+        network = {"mode": "public", "cidrs": []}
+    elif args.allow_cidr:
+        network = {"mode": "restricted", "cidrs": args.allow_cidr}
+    body = {"region_id": args.region, "app_name": args.app, "mode": args.mode}
+    if network is not None:
+        body["network"] = network
+    payload = api(args, "POST", "/api/v1/portal/instances/apply", body)
     if args.json and not args.wait:
         output_json(payload)
         return
@@ -258,6 +261,29 @@ def cmd_task(args: argparse.Namespace) -> None:
     if args.wait:
         task = wait_task(args, args.task_id, quiet=args.json)
     output_json(task)
+
+
+def cmd_network(args: argparse.Namespace) -> None:
+    overview = api(args, "GET", "/api/v1/portal/overview")
+    instance = find_app(overview, args.app)
+    path = f"/api/v1/portal/instances/{instance['id']}/network"
+    if args.public or args.allow_cidr:
+        if args.public and args.allow_cidr:
+            raise PoolCtlError("--public 和 --allow-cidr 不能同时使用")
+        body = {"mode": "public", "cidrs": []} if args.public else {"mode": "restricted", "cidrs": args.allow_cidr}
+        result = api(args, "PATCH", path, body)
+    else:
+        result = api(args, "GET", path)
+    if args.json:
+        output_json(result)
+        return
+    print(f"应用      {instance.get('app_name')}")
+    print(f"状态      {result.get('state')}")
+    print(f"模式      {result.get('mode')}")
+    print(f"生效      {', '.join(result.get('desired') or []) or '-'}")
+    print(f"云端      {', '.join(result.get('observed') or []) or '-'}")
+    if result.get("last_error"):
+        print(f"错误      {result.get('last_error')}")
 
 
 def cmd_connect(args: argparse.Namespace) -> None:
@@ -358,6 +384,8 @@ def build_parser() -> argparse.ArgumentParser:
     apply_cmd.add_argument("--app", required=True, help="应用名称")
     apply_cmd.add_argument("--region", required=True, help="地域 ID")
     apply_cmd.add_argument("--mode", required=True, choices=["single", "shared"], help="池模式")
+    apply_cmd.add_argument("--allow-cidr", action="append", default=[], help="允许访问的 IP/CIDR，可重复")
+    apply_cmd.add_argument("--public", action="store_true", help="允许任意公网地址访问")
     apply_cmd.add_argument("--wait", action="store_true", help="等待任务完成")
     apply_cmd.set_defaults(func=cmd_apply)
 
@@ -365,6 +393,12 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("app")
     get.add_argument("--wait", action="store_true", help="等待实例离开创建中状态")
     get.set_defaults(func=cmd_get)
+
+    network = sub.add_parser("network", help="查看或更新应用网络白名单", parents=[common])
+    network.add_argument("app")
+    network.add_argument("--allow-cidr", action="append", default=[], help="允许访问的 IP/CIDR，可重复；传入即更新")
+    network.add_argument("--public", action="store_true", help="允许任意公网地址访问；传入即更新")
+    network.set_defaults(func=cmd_network)
 
     task = sub.add_parser("task", help="查看异步任务", parents=[common])
     task.add_argument("task_id")

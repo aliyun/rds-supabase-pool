@@ -28,6 +28,8 @@ portal session or a PAT with the required scope. PAT scopes:
 - `instances:apply`
 - `instances:release`
 - `credentials:read`
+- `network:read`
+- `network:write`
 
 ## Public endpoints
 
@@ -97,6 +99,8 @@ All routes below require an admin session unless noted.
 | POST   | `/instances/:id/actions`       | Start, stop or restart                                                   |
 | POST   | `/instances/:id/allocate`      | Allocate to an app                                                       |
 | POST   | `/instances/:id/release`       | Return or destroy                                                        |
+| GET    | `/instances/:id/network`       | Read the Supabase instance IP allowlist                                  |
+| PATCH  | `/instances/:id/network`       | Replace the Supabase instance IP allowlist                               |
 | GET    | `/instances/:id/endpoints`     | Supabase endpoints                                                       |
 | GET    | `/instances/:id/auth-info`     | Supabase API keys (masked in UI)                                         |
 | GET    | `/instances/:id/resource`      | Current resource configuration                                           |
@@ -148,11 +152,47 @@ Portal endpoints are available both under `/portal/*` for session cookies and
 | POST     | `/v1/portal/instances/apply`         | Apply for an instance asynchronously            |
 | GET      | `/v1/portal/instances/:id`           | Owned instance detail                           |
 | POST     | `/v1/portal/instances/:id/release`   | Return an owned instance                        |
+| GET      | `/v1/portal/instances/:id/network`   | Read own Supabase IP allowlist (requires `network:read`) |
+| PATCH    | `/v1/portal/instances/:id/network`   | Update own Supabase IP allowlist (requires `network:write`) |
 | GET      | `/v1/portal/instances/:id/endpoints` | Connection endpoints                            |
 | GET      | `/v1/portal/instances/:id/auth-info` | API keys; requires `credentials:read`           |
 | GET      | `/v1/portal/tasks/:id`               | Task status                                     |
 | GET/POST | `/v1/portal/tokens`                  | List or create PATs                             |
 | DELETE   | `/v1/portal/tokens/:id`              | Revoke a PAT                                    |
+
+## Supabase network allowlist
+
+The allowlist is managed on the Supabase application instance, not on the
+underlying PostgreSQL instance. All lifecycle writes happen while the instance
+is `Running`.
+
+- Cold pool: `127.0.0.1`; external access is closed.
+- Restricted mode: `127.0.0.1` plus the requested application egress CIDRs.
+- Public mode: `0.0.0.0/0`; this is an explicit opt-in and can be disabled by
+  the pool's `network_policy.allow_public_access`.
+- Return: reset to `127.0.0.1` before stopping the instance.
+- RdsAi may report `net_maintaining` for a short time after a whitelist change;
+  lifecycle tasks wait for `Running` before applying the next step.
+- Instances report `network.state` as `pending`, `applying`, `applied`,
+  `resetting`, `closed`, `error` or `unknown`.
+
+Apply example:
+
+```json
+{
+  "region_id": "cn-shanghai",
+  "mode": "shared",
+  "app_name": "my-app",
+  "network": {
+    "mode": "restricted",
+    "cidrs": ["203.0.113.10/32"]
+  }
+}
+```
+
+Use `"mode": "public", "cidrs": []` for public access when allowed. A stopped
+instance cannot be modified; start it first. `0.0.0.0/0` is not accepted in
+restricted mode.
 
 ## Task model
 
@@ -188,6 +228,12 @@ curl -b cookie.txt https://<domain>/functions/v1/pool-api/api/overview?region_id
 # PAT-based portal request
 curl -H "Authorization: Bearer pctl_xxx" \
   https://<domain>/functions/v1/pool-api/api/v1/portal/instances
+
+# Update the Supabase instance allowlist
+curl -X PATCH -H "Authorization: Bearer pctl_xxx" \
+  -H 'content-type: application/json' \
+  -d '{"mode":"restricted","cidrs":["203.0.113.10/32"]}' \
+  https://<domain>/functions/v1/pool-api/api/v1/portal/instances/<id>/network
 ```
 
 Replace placeholders with your own values. Never paste real credentials into

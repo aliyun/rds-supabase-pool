@@ -20,7 +20,7 @@ set -a
 . "$ENV_FILE"
 set +a
 export DEPLOY_UI="${CALLER_DEPLOY_UI:-release}"
-export POOL_UI_RELEASE_TAG="${CALLER_UI_TAG:-${POOL_UI_RELEASE_TAG:-v0.1.0}}"
+export POOL_UI_RELEASE_TAG="${CALLER_UI_TAG:-${POOL_UI_RELEASE_TAG:-v0.1.1}}"
 
 echo "==> upgrade existing deployment"
 "$ROOT/edge/deploy.sh"
