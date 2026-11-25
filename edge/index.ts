@@ -11,6 +11,7 @@ const TOKEN_TTL = 7 * 24 * 3600;
 const SCOPES = ["instances:read", "instances:apply", "instances:release", "credentials:read", "network:read", "network:write"];
 const NETWORK_CLOSED = ["127.0.0.1"];
 const NETWORK_PUBLIC = ["0.0.0.0/0"];
+const POOL_WHITELIST_GROUP = "pool_white";
 const DEFAULT_NETWORK_POLICY = { allow_user_edit: true, allow_public_access: true, max_cidrs: 8 };
 
 const CORS = {
@@ -353,7 +354,7 @@ function taskPayload(row: any) {
     status: row.status,
     progress: row.progress,
     message: row.message,
-    result: row.result || {},
+    result: parseObject(row.result),
     error: row.error,
     created_at: row.created_at,
     started_at: row.started_at,
@@ -538,6 +539,15 @@ function sameWhitelist(left: unknown, right: unknown): boolean {
   const a = normalizeWhitelistForCompare(left);
   const b = normalizeWhitelistForCompare(right);
   return a.length === b.length && a.every((item, index) => item === b[index]);
+}
+
+function agentRuntimeEnabled(components: unknown): boolean {
+  if (!Array.isArray(components)) return false;
+  return components.some((item: any) => {
+    const type = String(item?.Type || item?.type || "").toLowerCase();
+    const status = String(item?.Status || item?.status || "").toLowerCase();
+    return type === "agent-runtime" && ["enable", "enabled", "running"].includes(status);
+  });
 }
 
 function maskSecret(value: string) {
@@ -873,7 +883,7 @@ class RealAdapter {
         group_name: item.GroupName || "default",
         cidrs: normalizeNetworkCidrs(item.IpWhitelist || "", 64),
       }));
-    const primary = groups.find((item: any) => item.group_name === "default") || groups[0] || { cidrs: [] };
+    const primary = groups.find((item: any) => item.group_name === POOL_WHITELIST_GROUP) || { cidrs: [] };
     return { instance_name: instanceName, cidrs: primary.cidrs, groups };
   }
 
@@ -881,6 +891,7 @@ class RealAdapter {
     const target = normalizeNetworkCidrs(cidrs, 64);
     const data = await this.rdsai("ModifyInstanceIpWhitelist", {
       InstanceName: instanceName,
+      GroupName: POOL_WHITELIST_GROUP,
       IpWhitelist: target.join(","),
       ModifyMode: "Cover",
     });
@@ -1010,6 +1021,13 @@ class RealAdapter {
     };
   }
 
+  async enableAgentRuntime(instanceName: string, vswitchId?: string) {
+    const body: Record<string, any> = { InstanceName: instanceName };
+    if (vswitchId) body.VSwitchId = vswitchId;
+    const data = await this.rdsai("EnableAgentRuntime", body);
+    return { instance_name: instanceName, request_id: String(data.RequestId || "") };
+  }
+
   async startSupabase(instanceName: string) {
     await this.rdsai("StartInstance", { InstanceName: instanceName });
   }
@@ -1036,6 +1054,7 @@ class RealAdapter {
 class MockAdapter {
   mode = "mock";
   static mockWhitelists = new Map<string, string[]>();
+  static mockAgentRuntime = new Set<string>();
   constructor(public region: string) {}  async listVpcs() {
     return [{ vpc_id: "vpc-mock-01", name: "Mock VPC", cidr: "172.16.0.0/12", status: "Available", region_id: this.region }];
   }
@@ -1070,7 +1089,14 @@ class MockAdapter {
     return randomId("ra-supabase-mock-");
   }
   async describeSupabase(instanceName: string) {
-    return { instance_name: instanceName, status: "Running", vpc_connection_string: "", public_connection_string: "", components: [] };
+    const components = MockAdapter.mockAgentRuntime.has(instanceName)
+      ? [{ Type: "agent-runtime", Status: "enable" }]
+      : [];
+    return { instance_name: instanceName, status: "Running", vpc_connection_string: "", public_connection_string: "", components };
+  }
+  async enableAgentRuntime(instanceName: string, _vswitchId?: string) {
+    MockAdapter.mockAgentRuntime.add(instanceName);
+    return { instance_name: instanceName, request_id: `mock-${randomToken(8)}` };
   }
   async startSupabase(_instanceName: string) {}
   async restartSupabase(_instanceName: string) {}
@@ -1132,6 +1158,7 @@ const MOCK_ACTION_MAP: Record<string, [string, string]> = {
   modifyCapacity: ["ModifyDBInstanceCapacity", "RdsAi"],
   createSupabase: ["CreateAppInstance", "RdsAi"],
   describeSupabase: ["DescribeAppInstanceAttribute", "RdsAi"],
+  enableAgentRuntime: ["EnableAgentRuntime", "RdsAi"],
   startSupabase: ["StartInstance", "RdsAi"],
   stopSupabase: ["StopInstance", "RdsAi"],
   restartSupabase: ["RestartInstance", "RdsAi"],
@@ -1474,6 +1501,16 @@ const BASE_SCHEMA_STATEMENTS = [
 let baseSchemaReady = false;
 const BASE_TABLE_NAMES = ["pool_instances", "tasks", "platform_users", "platform_tokens", "shared_pgs", "regions", "pools", "audit_events", "api_call_logs", "platform_config"];
 
+// Older writes stored detail as a JSON string; normalize before SQL reads nested fields.
+async function normalizeInstanceDetailEncoding() {
+  await sql.unsafe(`
+    update pool_instances
+    set detail = (detail #>> '{}')::json
+    where jsonb_typeof(detail::jsonb) = 'string'
+      and left(btrim(detail #>> '{}'), 1) = '{'
+  `);
+}
+
 async function ensureBaseSchema() {
   if (baseSchemaReady) return;
   const existing = await sql`
@@ -1491,12 +1528,14 @@ async function ensureBaseSchema() {
   `;
   const present = existing[0] || {};
   if (BASE_TABLE_NAMES.every((name) => !!present[name])) {
+    await normalizeInstanceDetailEncoding();
     baseSchemaReady = true;
     return;
   }
   for (const statement of BASE_SCHEMA_STATEMENTS) {
     await sql.unsafe(statement);
   }
+  await normalizeInstanceDetailEncoding();
   baseSchemaReady = true;
 }
 
@@ -1942,6 +1981,11 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function saveInstanceDetail(inst: any, detail: Record<string, any>, fields: Record<string, any> = {}) {
+  await setInstance(inst.id, { ...fields, detail: JSON.stringify(detail) });
+  return detail;
+}
+
 async function saveNetworkState(inst: any, network: Record<string, any>, fields: Record<string, any> = {}) {
   const detail = { ...parseObject(inst.detail), network };
   await setInstance(inst.id, { ...fields, detail: JSON.stringify(detail) });
@@ -2276,7 +2320,8 @@ async function setInstance(id: string, fields: Record<string, any>) {
   ]);
   for (const [key, value] of Object.entries(fields)) {
     if (value === undefined || !allowed.has(key)) continue;
-    await sql.unsafe(`update pool_instances set ${key} = $1, updated_at = now() where id = $2`, [value, id]);
+    const encoded = key === "detail" && typeof value === "string" ? parseObject(value) : value;
+    await sql.unsafe(`update pool_instances set ${key} = $1, updated_at = now() where id = $2`, [encoded, id]);
   }
 }
 
@@ -2403,10 +2448,94 @@ async function processPrewarm(task: any, inst: any) {
   }
   if (step === "wait_supabase") {
     const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status === "Stopped") {
+      await adapter.startSupabase(inst.supabase_instance_id);
+      return scheduleTask(task, "wait_supabase", 60, "等待 Supabase Running", 8);
+    }
     if (data.status !== "Running") return scheduleTask(task, "wait_supabase", 60, "等待 Supabase Running", 10);
     const cloudDetail = { ...detail, cloud: data };
     await setInstance(inst.id, { detail: JSON.stringify(cloudDetail), error: null });
+    if (config.agent_runtime_enabled === true) {
+      return scheduleTask(task, "enable_agent_runtime", 68, "启用 Agent Runtime", 1);
+    }
     return scheduleTask(task, "close_network", 70, "关闭公网白名单", 1);
+  }
+  if (step === "enable_agent_runtime") {
+    const current = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (agentRuntimeEnabled(current.components)) {
+      await saveInstanceDetail(inst, {
+        ...detail,
+        cloud: current,
+        agent_runtime: { enabled: true, state: "enabled", last_error: "", updated_by: "prewarm" },
+      }, { error: null });
+      return scheduleTask(task, "close_network", 70, "关闭公网白名单", 1);
+    }
+    try {
+      const vswitchId = inst.vswitch_id || pool.vswitch_id;
+      await adapter.enableAgentRuntime(inst.supabase_instance_id, vswitchId);
+      await setInstance(inst.id, {
+        detail: JSON.stringify({
+          ...parseObject(inst.detail),
+          agent_runtime: { enabled: false, state: "enabling", last_error: "", updated_by: "prewarm" },
+        }),
+      });
+      return scheduleTask(task, "wait_agent_runtime", 73, "等待 Agent Runtime 就绪", 10);
+    } catch (err) {
+      const message = `启用 Agent Runtime 失败：${String(err)}`;
+      await setInstance(inst.id, {
+        detail: JSON.stringify({
+          ...parseObject(inst.detail),
+          agent_runtime: { enabled: false, state: "error", last_error: String(err), updated_by: "prewarm" },
+        }),
+        status: "Failed",
+        error: message,
+      });
+      try {
+        await adapter.stopSupabase(inst.supabase_instance_id, config.stop_mode === "force");
+        await setInstance(inst.id, { cloud_status: "Stopped" });
+      } catch {
+        // leave the instance stopped-or-running; it is marked Failed
+      }
+      await failTask(task, message, true);
+      return;
+    }
+  }
+  if (step === "wait_agent_runtime") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status !== "Running" || !agentRuntimeEnabled(data.components)) {
+      const result = parseObject(task.result);
+      const attempts = Number(result.prewarm_runtime_wait_attempts || 0) + 1;
+      if (attempts >= 90) {
+        const message = "等待 Agent Runtime 就绪超时";
+        await setInstance(inst.id, {
+          detail: JSON.stringify({
+            ...parseObject(inst.detail),
+            agent_runtime: { enabled: false, state: "error", last_error: message, updated_by: "prewarm" },
+          }),
+          status: "Failed",
+          error: message,
+        });
+        try {
+          await adapter.stopSupabase(inst.supabase_instance_id, config.stop_mode === "force");
+          await setInstance(inst.id, { cloud_status: "Stopped" });
+        } catch {
+          // keep the timeout failure visible; the instance is not offered to users
+        }
+        await failTask(task, message, true);
+        return;
+      }
+      await updateTask(task, {
+        result: JSON.stringify({ ...result, prewarm_runtime_wait_attempts: attempts }),
+      });
+      return scheduleTask(task, "wait_agent_runtime", 74, `等待 Agent Runtime 就绪（${data.status}）`, 10);
+    }
+    const runtimeDetail = {
+      ...parseObject(inst.detail),
+      cloud: data,
+      agent_runtime: { enabled: true, state: "enabled", last_error: "", updated_by: "prewarm" },
+    };
+    await setInstance(inst.id, { detail: JSON.stringify(runtimeDetail), error: null });
+    return scheduleTask(task, "close_network", 76, "关闭公网白名单", 1);
   }
   if (step === "close_network") {
     try {
@@ -2625,6 +2754,8 @@ async function processRelease(task: any, inst: any) {
   const adapter = cloudAdapter(payload.cloud_mode || CLOUD_MODE, inst.region_id);
   const step = task.step || (payload.destroy ? "delete_supabase" : "stop");
   const detail = parseObject(inst.detail);
+  const poolRows = inst.pool_id ? await sql`select config from pools where id = ${inst.pool_id} limit 1` : [];
+  const releasePoolConfig = poolConfig(poolRows[0]?.config);
   if (payload.destroy) {
     if (step === "delete_supabase") {
       if (inst.supabase_instance_id) await adapter.deleteSupabase(inst.supabase_instance_id);
@@ -2664,10 +2795,79 @@ async function processRelease(task: any, inst: any) {
   if (step === "wait_network") {
     const data = await adapter.describeSupabase(inst.supabase_instance_id);
     if (data.status !== "Running") return scheduleTask(task, "wait_network", 48, `等待网络配置完成（${data.status}）`, 5);
+    const runtimeEnabled = detail.agent_runtime?.enabled === true || agentRuntimeEnabled(data.components);
+    if (releasePoolConfig.agent_runtime_enabled !== false && !runtimeEnabled) {
+      return scheduleTask(task, "enable_agent_runtime", 50, "归还时启用 Agent Runtime", 1);
+    }
     return scheduleTask(task, "stop_supabase", 50, "停止实例", 1);
   }
+  if (step === "enable_agent_runtime") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (detail.agent_runtime?.enabled === true || agentRuntimeEnabled(data.components)) {
+      await saveInstanceDetail(inst, {
+        ...detail,
+        agent_runtime: { enabled: true, state: "enabled", last_error: "", updated_by: "release" },
+      });
+      return scheduleTask(task, "stop_supabase", 55, "停止实例", 1);
+    }
+    try {
+      await adapter.enableAgentRuntime(inst.supabase_instance_id, inst.vswitch_id || "");
+      await saveInstanceDetail(inst, {
+        ...detail,
+        agent_runtime: { enabled: false, state: "enabling", last_error: "", updated_by: "release" },
+      });
+      await writeAuditEvent(inst.id, "agent_runtime_enable", "归还时启用 Agent Runtime", {});
+      return scheduleTask(task, "wait_agent_runtime", 53, "等待 Agent Runtime 就绪", 10);
+    } catch (err) {
+      await saveInstanceDetail(inst, {
+        ...detail,
+        agent_runtime: { enabled: false, state: "error", last_error: String(err), updated_by: "release" },
+      });
+      await writeAuditEvent(inst.id, "agent_runtime_enable_failed", "归还时启用 Agent Runtime 失败", {
+        error: String(err),
+      });
+      return scheduleTask(task, "stop_supabase", 55, "启用失败，继续停止实例", 1);
+    }
+  }
+  if (step === "wait_agent_runtime") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status === "Running" && agentRuntimeEnabled(data.components)) {
+      await saveInstanceDetail(inst, {
+        ...detail,
+        cloud: data,
+        agent_runtime: { enabled: true, state: "enabled", last_error: "", updated_by: "release" },
+      });
+      return scheduleTask(task, "stop_supabase", 58, "停止实例", 1);
+    }
+    const result = parseObject(task.result);
+    const attempts = Number(result.release_runtime_wait_attempts || 0) + 1;
+    if (attempts >= 90) {
+      await saveInstanceDetail(inst, {
+        ...detail,
+        agent_runtime: {
+          enabled: false,
+          state: "error",
+          last_error: "等待 Agent Runtime 超时",
+          updated_by: "release",
+        },
+      });
+      await writeAuditEvent(inst.id, "agent_runtime_enable_timeout", "归还时等待 Agent Runtime 超时", {});
+      return scheduleTask(task, "stop_supabase", 58, "等待超时，继续停止实例", 1);
+    }
+    await updateTask(task, {
+      result: JSON.stringify({ ...result, release_runtime_wait_attempts: attempts }),
+    });
+    return scheduleTask(task, "wait_agent_runtime", 55, `等待 Agent Runtime 就绪（${data.status}）`, 10);
+  }
   if (step === "stop_supabase") {
-    if (inst.supabase_instance_id) await adapter.stopSupabase(inst.supabase_instance_id, false);
+    if (inst.supabase_instance_id) {
+      const current = await adapter.describeSupabase(inst.supabase_instance_id);
+      if (current.status === "Stopped") return scheduleTask(task, "wait_stopped", 60, "等待实例停止", 2);
+      if (current.status !== "Running") {
+        return scheduleTask(task, "stop_supabase", 58, `等待实例稳定后停止（${current.status}）`, 8);
+      }
+      await adapter.stopSupabase(inst.supabase_instance_id, false);
+    }
     return scheduleTask(task, "wait_stopped", 60, "等待实例停止", 5);
   }
   if (step === "wait_stopped") {
@@ -2682,6 +2882,140 @@ async function processRelease(task: any, inst: any) {
   }
 }
 
+async function failAgentRuntimeBackfill(task: any, inst: any, adapter: any, message: string) {
+  let stopped = false;
+  try {
+    await adapter.stopSupabase(inst.supabase_instance_id, false);
+    stopped = true;
+  } catch (err) {
+    console.error(`agent runtime backfill stop failed: ${String(err)}`);
+  }
+  await failTask(task, message, true);
+  if (stopped) {
+    // The task stays failed, but the cold instance remains reusable.
+    await setInstance(inst.id, { status: "InCold", cloud_status: "Stopped" });
+  }
+}
+
+async function processAgentRuntimeBackfill(task: any, inst: any) {
+  const payload = parseObject(task.payload);
+  const adapter = cloudAdapter(payload.cloud_mode || CLOUD_MODE, inst.region_id);
+  const step = task.step || "start";
+  const detail = parseObject(inst.detail);
+  if (!inst.supabase_instance_id) {
+    await failTask(task, "实例尚未创建 Supabase 资源", true);
+    return;
+  }
+  if (step === "start") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status === "Stopped") {
+      await adapter.startSupabase(inst.supabase_instance_id);
+      return scheduleTask(task, "wait_running", 25, "等待实例 Running", 8);
+    }
+    if (data.status !== "Running") {
+      return scheduleTask(task, "start", 20, `等待实例启动（${data.status}）`, 8);
+    }
+    return scheduleTask(task, "enable_agent_runtime", 40, "启用 Agent Runtime", 1);
+  }
+  if (step === "wait_running") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status !== "Running") return scheduleTask(task, "wait_running", 30, `等待实例 Running（${data.status}）`, 8);
+    return scheduleTask(task, "enable_agent_runtime", 40, "启用 Agent Runtime", 1);
+  }
+  if (step === "enable_agent_runtime") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (agentRuntimeEnabled(data.components)) {
+      await saveInstanceDetail(inst, {
+        ...detail,
+        agent_runtime: { enabled: true, state: "enabled", last_error: "", updated_by: "admin_backfill" },
+      });
+      return scheduleTask(task, "close_network", 70, "关闭白名单", 1);
+    }
+    try {
+      await adapter.enableAgentRuntime(inst.supabase_instance_id, inst.vswitch_id || "");
+      await saveInstanceDetail(inst, {
+        ...detail,
+        agent_runtime: { enabled: false, state: "enabling", last_error: "", updated_by: "admin_backfill" },
+      });
+      await writeAuditEvent(inst.id, "agent_runtime_enable", "管理员启用 Agent Runtime", {});
+      return scheduleTask(task, "wait_agent_runtime", 50, "等待 Agent Runtime 就绪", 10);
+    } catch (err) {
+      const message = `启用 Agent Runtime 失败：${String(err)}`;
+      await saveInstanceDetail(inst, {
+        ...detail,
+        agent_runtime: { enabled: false, state: "error", last_error: String(err), updated_by: "admin_backfill" },
+      }, { error: message });
+      await failAgentRuntimeBackfill(task, inst, adapter, message);
+      return;
+    }
+  }
+  if (step === "wait_agent_runtime") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status === "Running" && agentRuntimeEnabled(data.components)) {
+      await saveInstanceDetail(inst, {
+        ...detail,
+        cloud: data,
+        agent_runtime: { enabled: true, state: "enabled", last_error: "", updated_by: "admin_backfill" },
+      });
+      return scheduleTask(task, "close_network", 70, "关闭白名单", 1);
+    }
+    const result = parseObject(task.result);
+    const attempts = Number(result.runtime_wait_attempts || 0) + 1;
+    if (attempts >= 90) {
+      const message = "等待 Agent Runtime 就绪超时";
+      await saveInstanceDetail(inst, {
+        ...detail,
+        agent_runtime: { enabled: false, state: "error", last_error: message, updated_by: "admin_backfill" },
+      }, { error: message });
+      await failAgentRuntimeBackfill(task, inst, adapter, message);
+      return;
+    }
+    await updateTask(task, { result: JSON.stringify({ ...result, runtime_wait_attempts: attempts }) });
+    return scheduleTask(task, "wait_agent_runtime", 55, `等待 Agent Runtime 就绪（${data.status}）`, 10);
+  }
+  if (step === "close_network") {
+    try {
+      await applyClosedNetwork(inst, adapter, "admin_backfill");
+      return scheduleTask(task, "wait_network", 78, "等待网络配置完成", 3);
+    } catch (err) {
+      const message = `关闭白名单失败：${String(err)}`;
+      await saveInstanceDetail(inst, {
+        ...detail,
+        agent_runtime: { enabled: true, state: "error", last_error: message, updated_by: "admin_backfill" },
+      }, { error: message });
+      await failAgentRuntimeBackfill(task, inst, adapter, message);
+      return;
+    }
+  }
+  if (step === "wait_network") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status !== "Running") return scheduleTask(task, "wait_network", 80, `等待网络配置完成（${data.status}）`, 5);
+    return scheduleTask(task, "stop_supabase", 85, "停止实例", 1);
+  }
+  if (step === "stop_supabase") {
+    const current = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (current.status === "Stopped") return scheduleTask(task, "wait_stopped", 90, "等待实例停止", 2);
+    if (current.status !== "Running") {
+      return scheduleTask(task, "stop_supabase", 88, `等待实例稳定后停止（${current.status}）`, 8);
+    }
+    await adapter.stopSupabase(inst.supabase_instance_id, false);
+    return scheduleTask(task, "wait_stopped", 90, "等待实例停止", 5);
+  }
+  if (step === "wait_stopped") {
+    if (adapter.mode === "real") {
+      const data = await adapter.describeSupabase(inst.supabase_instance_id);
+      if (data.status !== "Stopped") return scheduleTask(task, "wait_stopped", 92, `等待实例停止（${data.status}）`, 8);
+    }
+    await saveInstanceDetail(inst, {
+      ...detail,
+      agent_runtime: { enabled: true, state: "enabled", last_error: "", updated_by: "admin_backfill" },
+    }, { status: "InCold", cloud_status: "Stopped", error: null });
+    await finishTask(task, { instance_id: inst.id, status: "InCold" });
+    return;
+  }
+  await failTask(task, `未知步骤：${step}`, true);
+}
+
 const DEFAULT_POOL_CONFIG = {
   target: 2, max: 4, batch_size: 1, batch_interval_sec: 6, poll_interval_sec: 8, create_timeout_sec: 900,
   auto_refill: false, refill_interval_sec: 30, release_policy: "return", stop_mode: "normal",
@@ -2689,6 +3023,7 @@ const DEFAULT_POOL_CONFIG = {
   single_engine_version: "17.0", single_pg_security_ips: "127.0.0.1", public_endpoint_enabled: true,
   shared_pg_class: "pg.n2.2c.2m", shared_pg_storage: 20, shared_pg_category: "HighAvailability",
   shared_pg_engine_version: "18.0", network_policy: DEFAULT_NETWORK_POLICY,
+  agent_runtime_enabled: true,
 };
 
 function poolConfig(value: unknown): Record<string, any> {
@@ -2922,7 +3257,7 @@ async function enqueuePrewarm(pool: any, count: number): Promise<string[]> {
       insert into pool_instances (id, mode, pool_id, status, app_name, region_id, vpc_id, vswitch_id, instance_class, detail, is_deleted, created_at, updated_at)
       values (${instanceId}, ${pool.mode}, ${pool.id}, 'Creating', ${appName}, ${pool.region_id}, ${pool.vpc_id}, ${pool.vswitch_id},
               ${pool.mode === "shared" ? "rdsai.supabase.share.basic" : "rdsai.supabase.basic"},
-              ${JSON.stringify(detail)}::json, false, now(), now())
+              ${detail}::json, false, now(), now())
     `;
     const taskId = randomId();
     await sql`
@@ -3352,6 +3687,7 @@ async function workerTick() {
     if (task.kind === "prewarm") await processPrewarm(task, inst);
     else if (task.kind === "allocate") await processAllocate(task, inst);
     else if (task.kind === "release") await processRelease(task, inst);
+    else if (task.kind === "agent_runtime") await processAgentRuntimeBackfill(task, inst);
     else if (["start", "stop", "restart", "sync"].includes(task.kind)) await processAction(task, inst);
     else {
       await finishTask(task, { skipped: true });
@@ -3558,6 +3894,7 @@ async function handler(req: Request): Promise<Response> {
           { value: "sync", label: "同步" },
           { value: "selfheal", label: "自愈巡检" },
           { value: "shared_pg_create", label: "创建共享 PG" },
+          { value: "agent_runtime", label: "启用 Agent Runtime" },
         ],
         cpu_options: [2, 4, 8],
       });
@@ -3896,7 +4233,7 @@ async function handler(req: Request): Promise<Response> {
           insert into pool_instances (id, mode, pool_id, status, app_name, region_id, vpc_id, vswitch_id, instance_class, detail, is_deleted, created_at, updated_at)
           values (${instanceId}, ${pool.mode}, ${pool.id}, 'Creating', ${appName}, ${pool.region_id}, ${pool.vpc_id}, ${pool.vswitch_id},
                   ${pool.mode === "shared" ? "rdsai.supabase.share.basic" : "rdsai.supabase.basic"},
-                  ${JSON.stringify(detail)}::json, false, now(), now())
+                  ${detail}::json, false, now(), now())
         `;
         const taskId = randomId();
         await sql`
@@ -3907,6 +4244,47 @@ async function handler(req: Request): Promise<Response> {
         taskIds.push(taskId);
       }
       return json({ task_ids: taskIds, count: taskIds.length, pool_id: pool.id });
+    }
+
+    if (path === "/api/instances/backfill-agent-runtime" && method === "POST") {
+      if (!(await requireAdmin(req))) return error("需要管理员权限", 403);
+      const body = await req.json();
+      const conditions = [
+        "is_deleted = false",
+        "status = 'InCold'",
+        "supabase_instance_id is not null",
+        "coalesce(detail->'agent_runtime'->>'enabled', 'false') <> 'true'",
+        "not exists (select 1 from tasks t where t.target_id = pool_instances.id and t.kind = 'agent_runtime' and t.status in ('pending', 'running'))",
+      ];
+      const params: any[] = [];
+      if (body.pool_id) {
+        params.push(String(body.pool_id));
+        conditions.push(`pool_id = $${params.length}`);
+      }
+      if (body.region_id) {
+        params.push(String(body.region_id));
+        conditions.push(`region_id = $${params.length}`);
+      }
+      const limit = Math.max(1, Math.min(100, Number(body.limit || 50)));
+      params.push(limit);
+      const rows = await sql.unsafe(
+        `select * from pool_instances where ${conditions.join(" and ")} order by created_at asc limit $${params.length}`,
+        params,
+      );
+      const taskIds: string[] = [];
+      for (const inst of rows) {
+        const taskId = randomId();
+        const cloudMode = parseObject(inst.detail).cloud_mode || CLOUD_MODE;
+        await sql`
+          insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
+          values (${taskId}, 'agent_runtime', ${inst.mode}, ${inst.pool_id}, ${inst.id}, ${`启用 Agent Runtime ${inst.app_name}`}, 'pending', 0, '等待 worker',
+                  ${JSON.stringify({ instance_id: inst.id, cloud_mode: cloudMode, source: "admin_backfill" })}::json, '{}'::json, 'start', 0, now())
+        `;
+        await setInstance(inst.id, { status: "Creating", error: null });
+        await writeAuditEvent(inst.id, "agent_runtime_backfill", "管理员批量启用 Agent Runtime", { task_id: taskId });
+        taskIds.push(taskId);
+      }
+      return json({ task_ids: taskIds, count: taskIds.length });
     }
 
     if ((path === "/api/v1/portal/instances/apply" || path === "/api/portal/instances/apply") && method === "POST") {
@@ -5045,15 +5423,16 @@ async function handler(req: Request): Promise<Response> {
       const task: any = rows[0];
       if (!task || task.status !== "failed") return error("只有失败任务可以重试");
       if (task.target_id && task.kind !== "selfheal") {
-        const nextStatus = task.kind === "prewarm" ? "Creating" : task.kind === "release" ? "Releasing" : task.kind === "allocate" ? "InUse" : "";
+        const nextStatus = task.kind === "prewarm" ? "Creating" : task.kind === "release" ? "Releasing" : task.kind === "allocate" ? "InUse" : task.kind === "agent_runtime" ? "Creating" : "";
         if (nextStatus) await setInstance(task.target_id, { status: nextStatus, error: null });
         else await setInstance(task.target_id, { error: null });
       }
+      const nextStep = task.kind === "agent_runtime" ? "start" : task.kind === "prewarm" ? "prepare" : task.step || "prepare";
       const nextId = randomId();
       await sql`
         insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
         values (${nextId}, ${task.kind}, ${task.mode}, ${task.pool_id}, ${task.target_id}, ${`重试：${task.title}`}, 'pending', 0, '等待 worker',
-                ${task.payload || "{}"}, '{}'::json, ${task.step || "prepare"}, 0, now())
+                ${task.payload || "{}"}, '{}'::json, ${nextStep}, 0, now())
       `;
       return json({ task_id: nextId });
     }

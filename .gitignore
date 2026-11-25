@@ -38,3 +38,4 @@ edge/.build/
 
 # Edge 首次部署生成的本地凭证
 edge/.bootstrap.env
+edge/.bootstrap.env.*

@@ -174,7 +174,7 @@ export AUTO_WHITELIST=false
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.1"
+export POOL_UI_RELEASE_TAG="v0.1.2"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<8~32 位，至少含大写/小写/数字/特殊字符中的三类>"
@@ -194,7 +194,7 @@ export DINGTALK_SECRET="SEC..."   # 仅钉钉机器人使用“加签”时需�
 
 ### UI 部署模式
 
-客户部署默认使用 Release 产物，无需安装 Node/npm；前提是对应 GitHub Release 已上传 `pool-ui-v0.1.1.ts` 和 `.sha256`。脚本会下载并校验 SHA256，校验失败会中止。
+客户部署默认使用 Release 产物，无需安装 Node/npm；前提是对应 GitHub Release 已上传 `pool-ui-v0.1.2.ts` 和 `.sha256`。脚本会下载并校验 SHA256，校验失败会中止。
 
 源码开发或发版时使用 `DEPLOY_UI=source`（脚本默认值，需要 Node 20.19+）：
 
@@ -211,10 +211,10 @@ DEPLOY_UI=0 ./edge/bootstrap.sh
 构建 Release 产物：
 
 ```bash
-./scripts/build-ui-release.sh v0.1.1
+./scripts/build-ui-release.sh v0.1.2
 ```
 
-生成 `edge/.build/release/pool-ui-v0.1.1.ts` 和 `.sha256`，上传到对应 GitHub Release 即可。可用 `POOL_UI_RELEASE_REPO`、`POOL_UI_RELEASE_URL` 覆盖默认下载地址。
+生成 `edge/.build/release/pool-ui-v0.1.2.ts` 和 `.sha256`，上传到对应 GitHub Release 即可。可用 `POOL_UI_RELEASE_REPO`、`POOL_UI_RELEASE_URL` 覆盖默认下载地址。
 
 脚本会调用 RdsAi/RDS API 自动解析：
 
@@ -314,23 +314,81 @@ https://<domain>/functions/v1/pool-api
 
 ## 9. 升级 / 重新部署
 
-代码更新后，直接执行：
+### 9.1 正常升级
+
+已有 `edge/.bootstrap.env` 时，直接执行：
 
 ```bash
 ./edge/upgrade.sh
 ```
 
-`upgrade.sh` 会自动读取 `edge/.bootstrap.env`，更新 `pool-api`、`pool-ui`、`pool-notifier`，重挂 worker/watchdog，并执行健康检查。`deploy.sh` 只作为内部部署实现，客户不需要直接调用。
+`upgrade.sh` 会自动读取部署坐标，更新 `pool-api`、`pool-ui`、`pool-notifier`，重挂 worker/watchdog，并执行健康检查。`deploy.sh` 只作为内部部署实现，客户不需要直接调用。
 
-如果 `.bootstrap.env` 丢失，需要先恢复部署配置；不要用 `bootstrap.sh` 对已有实例做升级，它可能重置 `pool_admin`、JWT/worker token 等配置。
+如果 `.bootstrap.env` 中保存的还是旧 UI tag（例如 `v0.1.1`），升级到新 UI 时需要显式覆盖：
+
+```bash
+POOL_UI_RELEASE_TAG=v0.1.2 ./edge/upgrade.sh
+```
+
+也可以直接把 `.bootstrap.env` 中的 `POOL_UI_RELEASE_TAG` 改成 `v0.1.2`。
+
+### 9.2 没有 .bootstrap.env
+
+如果升级机器上没有 `.bootstrap.env`，但能提供控制面实例名、地域和 AK/SK，可以直接升级：
+
+```bash
+INSTANCE_NAME="ra-xxxxxxxx" \
+REGION="cn-shanghai" \
+ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
+ALIBABA_CLOUD_ACCESS_KEY_SECRET="<SK>" \
+WORKER_TOKEN="<原 worker token>" \
+./edge/upgrade.sh
+```
+
+`upgrade.sh` 会通过 RdsAi 自动解析 `SUPABASE_URL` 和 `SUPABASE_SERVICE_KEY`，不需要 `pool_admin` 密码。AK/SK 只用于本次解析，不会写入本地部署文件。
+
+如果已经知道控制面地址和 service key，也可以跳过实例解析：
+
+```bash
+SUPABASE_URL="https://<domain>" \
+SUPABASE_SERVICE_KEY="<service-key>" \
+WORKER_TOKEN="<原 worker token>" \
+./edge/upgrade.sh
+```
+
+升级成功后，脚本会把 `SUPABASE_URL`、`SUPABASE_SERVICE_KEY`、`WORKER_TOKEN` 和 UI 配置保存到 `edge/.bootstrap.env`（权限 0600，已加入 `.gitignore`），后续可以直接执行 `./edge/upgrade.sh`。
+
+### 9.3 WORKER_TOKEN 丢失
+
+如果不知道原 `WORKER_TOKEN`，设置 `RESET_WORKER_TOKEN=1`。脚本会自动生成新 token、更新 Edge Secret、重新部署函数并重挂 scheduler：
+
+```bash
+INSTANCE_NAME="ra-xxxxxxxx" \
+REGION="cn-shanghai" \
+ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
+ALIBABA_CLOUD_ACCESS_KEY_SECRET="<SK>" \
+RESET_WORKER_TOKEN=1 \
+./edge/upgrade.sh
+```
+
+也可以同时传入新的 `WORKER_TOKEN="<新 token>"`，脚本会使用该值而不是自动生成。
+
+重置影响：
+
+- 升级完成后旧 token 失效，外部手工调用 worker tick 的脚本需要同步更换；
+- 两个 pg_cron 任务重挂前会短暂 401，后台任务可能暂停约 1 分钟，但任务记录在数据库中，不会丢失；
+- 不会修改 JWT、数据库密码、PAT 或池数据；
+- 新 token 会保存到 `edge/.bootstrap.env`，不要提交该文件。
+
+不要用 `bootstrap.sh` 对已有实例做升级或恢复，它会重写 JWT、数据库密码和整套 Edge Secrets，影响面更大。
 
 说明：
 
 - 升级默认使用 release UI；可用 `DEPLOY_UI=source ./edge/upgrade.sh` 改从源码构建。
 - 调度使用 Edge 内部 `SUPABASE_URL`（VPC 地址），不会因为重新部署而变化。
-- Secrets 接口不会回显明文，`WORKER_TOKEN` 以本地 `.bootstrap.env` 为准；丢失时只能重新生成并重新部署。
+- Secrets 接口不会回显明文；`WORKER_TOKEN` 以本地 `.bootstrap.env` 为准，丢失时使用 `RESET_WORKER_TOKEN=1`。
 
-### 9.1 监控与告警（可选）
+### 9.4 监控与告警（可选）
 
 控制面会记录两类 heartbeat：
 
@@ -345,7 +403,7 @@ https://<domain>/functions/v1/pool-api
 - 不设置 `DINGTALK_WEBHOOK`：heartbeat 和 watchdog 仍运行，outbox 仍记录，但不调用 notifier，也不会产生 503 或影响主业务；
 - `DINGTALK_SECRET`：仅机器人使用“加签”时设置；使用自定义关键词时可以不配置。
 
-`bootstrap.sh` 会把环境变量中的这两个可选 Secret 写入 Edge Secrets。`upgrade.sh` 默认不修改 Secrets；已有实例新增或更换 webhook 时，可以直接执行：
+`bootstrap.sh` 会把环境变量中的这两个可选 Secret 写入 Edge Secrets。`upgrade.sh` 除显式设置 `RESET_WORKER_TOKEN=1` 外不修改 Secrets；已有实例新增或更换 webhook 时，可以直接执行：
 
 ```bash
 DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
@@ -517,7 +575,7 @@ curl -H "X-Worker-Token: <WORKER_TOKEN>" \
 - `rds:DeleteDBInstance` 只在使用单租池并删除真实 PG 时需要；可先不授予，后续按需添加。
 - `bssapi:DescribeInstanceBill` 仅影响池成本页；不授予时预检会提示账单权限警告。
 - `ram:CreateServiceLinkedRole` 用于首次创建三个服务关联角色；如果主账号已经创建好，可以只保留 `ram:GetRole`。
-- `rdsai:EnableAgentRuntime` 仅创建控制面实例时需要；如果控制面由主账号创建，RAM 用户可以不授予。
+- `rdsai:EnableAgentRuntime` 用于控制面实例，以及开启池级 `agent_runtime_enabled` 后的池中 Supabase 实例；如果不启用池实例 Agent Runtime 且控制面由主账号创建，可以不授予。
 - `rdsai:DescribeInstanceIpWhitelist` / `rdsai:ModifyInstanceIpWhitelist` 用于池中 Supabase 实例的生命周期白名单管理，必须授予；它和 PostgreSQL 的 `rds:ModifySecurityIps` 是两套权限。
 - Edge 的自动白名单依赖 `rds:ModifySecurityIps`；不授予时设置 `AUTO_WHITELIST=false` 并手动加白。
 - 使用 RAM 用户的 AK/SK 填入 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET`，不需要使用主账号 AK。

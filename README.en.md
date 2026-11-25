@@ -21,6 +21,7 @@ RDS Supabase Pool Console is an experimental control plane for pre-warming Supab
 - PAT authentication and `poolctl` CLI for user automation.
 - Task orchestration, retries, self-healing, API audit and pool cost views.
 - Real and mock cloud adapters.
+- Agent Runtime is enabled by default for newly prewarmed pooled instances and on return when needed.
 
 ## Architecture
 
@@ -51,7 +52,7 @@ Prerequisites:
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.1"
+export POOL_UI_RELEASE_TAG="v0.1.2"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<strong-password>"
@@ -67,7 +68,7 @@ export DINGTALK_SECRET="SEC..."   # required only for a signed robot
 ./edge/bootstrap.sh
 ```
 
-> Release mode requires `pool-ui-v0.1.1.ts` and its `.sha256` to be uploaded to the corresponding GitHub Release.
+> Release mode requires `pool-ui-v0.1.2.ts` and its `.sha256` to be uploaded to the corresponding GitHub Release.
 > For development or before a release exists, use `DEPLOY_UI=source ./edge/bootstrap.sh` (requires Node/npm).
 > To update the API only, use `DEPLOY_UI=0 ./edge/bootstrap.sh`.
 
@@ -90,13 +91,37 @@ full guide.
 
 ## Upgrade / recover an existing instance
 
-There is no need to rerun `bootstrap.sh` on an existing instance. Run:
+There is no need to rerun `bootstrap.sh` on an existing instance. With `edge/.bootstrap.env`, run:
 
 ```bash
 ./edge/upgrade.sh
 ```
 
-The script loads the initial deployment's `edge/.bootstrap.env`, updates `pool-api`, `pool-ui`, `pool-notifier` and the watchdog, and runs a health check.
+The script updates `pool-api`, `pool-ui`, `pool-notifier` and the watchdog, and runs a health check.
+
+Without `.bootstrap.env`, provide the instance name, region and AK/SK:
+
+```bash
+INSTANCE_NAME="ra-xxxxxxxx" \
+REGION="cn-shanghai" \
+ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
+ALIBABA_CLOUD_ACCESS_KEY_SECRET="<SK>" \
+WORKER_TOKEN="<existing worker token>" \
+./edge/upgrade.sh
+```
+
+If the existing `WORKER_TOKEN` is unavailable, there is no need to recover it. Reset it with:
+
+```bash
+INSTANCE_NAME="ra-xxxxxxxx" \
+REGION="cn-shanghai" \
+ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
+ALIBABA_CLOUD_ACCESS_KEY_SECRET="<SK>" \
+RESET_WORKER_TOKEN=1 \
+./edge/upgrade.sh
+```
+
+The script generates a new token, updates the Edge Secret, redeploys and re-hooks the scheduler. The old token stops working after the upgrade and background tasks may pause for about a minute, but task records are preserved; JWT secrets, database passwords and pool data are not changed.
 
 To add or replace DingTalk alerting:
 
@@ -104,7 +129,7 @@ To add or replace DingTalk alerting:
 DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
 ```
 
-If `edge/.bootstrap.env` is missing, restore the deployment configuration first by following the deployment guide. Do not use `bootstrap.sh` for upgrades or recovery on an existing instance.
+After a no-bootstrap upgrade, the script saves the deployment coordinates and token to `.bootstrap.env` (0600, ignored by Git). Do not use `bootstrap.sh` for upgrades or recovery on an existing instance.
 
 ## User API and CLI
 
@@ -132,7 +157,7 @@ The control plane records heartbeats for the `pool-api` request layer and the ba
 - **`DINGTALK_WEBHOOK` is the external alert switch.** When set, DingTalk delivery is enabled. When omitted, heartbeats, the watchdog and the outbox remain active, but the notifier is not called and the main service is unaffected.
 - `DINGTALK_SECRET` is only required when the robot uses signing; a keyword-secured robot does not need it.
 - For a new deployment, pass both optional values to `bootstrap.sh`; it writes them to Edge Secrets.
-- For an existing deployment, use `./edge/upgrade.sh`. It updates `pool-api` / `pool-ui` / `pool-notifier` and re-hooks the watchdog. It does not change Edge Secrets by default; to add or replace the webhook, run:
+- For an existing deployment, use `./edge/upgrade.sh`. It updates `pool-api` / `pool-ui` / `pool-notifier` and re-hooks the watchdog. Except for an explicit `RESET_WORKER_TOKEN=1`, it does not change Edge Secrets; to add or replace the webhook, run:
 
 ```bash
 DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
@@ -148,6 +173,7 @@ Alert text is written for customers: impact and recommended action come first; i
 
 - Keep AK/SK, service keys, JWT secrets and database passwords in Edge Secrets or a local `0600` file. Never commit them.
 - `edge/.bootstrap.env` is ignored by Git and contains deployment secrets.
+- Supabase instance allowlists are stored in the dedicated `pool_white` group; the instance's `default` group and VPC rules are left untouched.
 - Admin sessions use HttpOnly cookies; PATs are stored as hashes with scopes and expiry.
 - Users can only access their own instances. Only admins can delete resources.
 - Do not publish real credentials, instance IDs or customer data in public content.

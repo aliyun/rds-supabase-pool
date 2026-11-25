@@ -833,6 +833,14 @@ function PoolConfigModal({ pool, onClose, onSaved }: { pool: RegionPool; onClose
               onChange={(value) => setConfig({ ...config, public_endpoint_enabled: value })}
               label="开启公网连接"
             />
+            <Toggle
+              checked={config.agent_runtime_enabled === true}
+              onChange={(value) => setConfig({ ...config, agent_runtime_enabled: value })}
+              label="启用 Agent Runtime"
+            />
+          </div>
+          <div className="mt-2 text-[10px] leading-5 text-slate-500">
+            默认开启；仅对后续新预热实例及归还时补启用的实例生效。启用会增加约 2~5 分钟预热/归还时间，并可能创建 VPC 终端节点和安全组。
           </div>
         </div>
 

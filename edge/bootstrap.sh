@@ -92,7 +92,7 @@ case "$DEPLOY_UI" in
     ;;
 esac
 if [ "$DEPLOY_UI" = "release" ]; then
-  : "${POOL_UI_RELEASE_TAG:?DEPLOY_UI=release 需要设置 POOL_UI_RELEASE_TAG，例如 v0.1.1}"
+  : "${POOL_UI_RELEASE_TAG:?DEPLOY_UI=release 需要设置 POOL_UI_RELEASE_TAG，例如 v0.1.2}"
 fi
 
 WORKER_TOKEN="${WORKER_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')}"

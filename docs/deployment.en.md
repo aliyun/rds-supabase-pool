@@ -19,7 +19,7 @@ The deployment script does not create the control-plane instance.
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.1"
+export POOL_UI_RELEASE_TAG="v0.1.2"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<strong-password>"
@@ -51,7 +51,7 @@ performs a health check.
 ### UI deployment modes
 
 Customer deployments use a prebuilt GitHub Release artifact and do not require
-Node/npm. The corresponding release must contain `pool-ui-v0.1.1.ts` and its
+Node/npm. The corresponding release must contain `pool-ui-v0.1.2.ts` and its
 `.sha256`; the script verifies the checksum and aborts on mismatch.
 
 For source development or release building, use `DEPLOY_UI=source` (requires
@@ -64,10 +64,10 @@ DEPLOY_UI=source ./edge/bootstrap.sh
 To update only the API, use `DEPLOY_UI=0`. Build release assets with:
 
 ```bash
-./scripts/build-ui-release.sh v0.1.1
+./scripts/build-ui-release.sh v0.1.2
 ```
 
-Then upload `edge/.build/release/pool-ui-v0.1.1.ts` and `.sha256` to the
+Then upload `edge/.build/release/pool-ui-v0.1.2.ts` and `.sha256` to the
 corresponding GitHub Release. `POOL_UI_RELEASE_REPO` and
 `POOL_UI_RELEASE_URL` can override the default download location.
 
@@ -81,18 +81,87 @@ corresponding GitHub Release. `POOL_UI_RELEASE_REPO` and
 
 ## 5. Upgrade
 
+### 5.1 With edge/.bootstrap.env
+
 ```bash
 ./edge/upgrade.sh
 ```
 
-`upgrade.sh` loads `edge/.bootstrap.env`, updates `pool-api`, `pool-ui`,
-`pool-notifier` and the worker/watchdog schedules, then runs a health check.
-`deploy.sh` is an internal implementation detail and does not need to be
-invoked by customers.
+`upgrade.sh` loads the saved deployment coordinates, updates `pool-api`,
+`pool-ui`, `pool-notifier` and the worker/watchdog schedules, then runs a
+health check. `deploy.sh` is an internal implementation detail and does not
+need to be invoked by customers.
 
-If `.bootstrap.env` is missing, restore the deployment configuration first.
-Do not use `bootstrap.sh` to upgrade an existing instance; it may reset
-`pool_admin`, the JWT secret, worker token and other configuration.
+If `edge/.bootstrap.env` still pins an older UI tag such as `v0.1.1`, select the
+new UI explicitly:
+
+```bash
+POOL_UI_RELEASE_TAG=v0.1.2 ./edge/upgrade.sh
+```
+
+You can also change `POOL_UI_RELEASE_TAG` in `edge/.bootstrap.env` to `v0.1.2`.
+
+### 5.2 Without edge/.bootstrap.env
+
+If the upgrade host has no `.bootstrap.env`, provide the instance name, region
+and AK/SK:
+
+```bash
+INSTANCE_NAME="ra-xxxxxxxx" \
+REGION="cn-shanghai" \
+ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
+ALIBABA_CLOUD_ACCESS_KEY_SECRET="<SK>" \
+WORKER_TOKEN="<existing worker token>" \
+./edge/upgrade.sh
+```
+
+`upgrade.sh` resolves `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` through RdsAi;
+the `pool_admin` password is not required. The AK/SK is used only for this
+lookup and is not written to the local deployment file.
+
+If the control-plane URL and service key are already known, you can skip the
+instance lookup:
+
+```bash
+SUPABASE_URL="https://<domain>" \
+SUPABASE_SERVICE_KEY="<service-key>" \
+WORKER_TOKEN="<existing worker token>" \
+./edge/upgrade.sh
+```
+
+After a successful upgrade, the script saves the URL, service key, worker token
+and UI settings to `edge/.bootstrap.env` (mode 0600, ignored by Git).
+
+### 5.3 Lost WORKER_TOKEN
+
+Set `RESET_WORKER_TOKEN=1` when the old token is unavailable. The script
+generates a new token, updates the Edge Secret, redeploys the functions and
+re-hooks the scheduler:
+
+```bash
+INSTANCE_NAME="ra-xxxxxxxx" \
+REGION="cn-shanghai" \
+ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
+ALIBABA_CLOUD_ACCESS_KEY_SECRET="<SK>" \
+RESET_WORKER_TOKEN=1 \
+./edge/upgrade.sh
+```
+
+You can also pass a new `WORKER_TOKEN="<new token>"`; the script then uses that
+value instead of generating one.
+
+Reset impact:
+
+- The old token stops working after the upgrade. External scripts that call the
+  worker tick endpoint must be updated.
+- The two pg_cron jobs may return 401 until they are re-hooked. Background
+  tasks can pause for about a minute, but task records are stored in the
+  database and are not lost.
+- JWT secrets, database passwords, PATs and pool data are not changed.
+- The new token is saved to `edge/.bootstrap.env`; do not commit that file.
+
+Do not use `bootstrap.sh` to upgrade or recover an existing instance. It
+rewrites the JWT secret, database passwords and the full set of Edge Secrets.
 
 ## 6. Monitoring and alerts
 
@@ -110,8 +179,9 @@ recovery notices.
   robot does not need it.
 
 `bootstrap.sh` writes these optional secrets when they are provided in the
-environment. `upgrade.sh` does not update Edge Secrets by default. To add or
-replace the webhook on an existing instance, run:
+environment. Except for an explicit `RESET_WORKER_TOKEN=1`, `upgrade.sh` does
+not update Edge Secrets. To add or replace the webhook on an existing
+instance, run:
 
 ```bash
 DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh

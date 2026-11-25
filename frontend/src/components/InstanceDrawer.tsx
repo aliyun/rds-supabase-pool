@@ -271,6 +271,12 @@ export function InstanceDrawer({
       ["应用名称", String(instance.detail?.bound_app_name || "—")],
       ["复用策略", instance.status === "InCold" && instance.detail?.reserved ? "仅原应用复用" : "可重新分配"],
       ["绑定使用者", instance.bound_user || "—"],
+      [
+        "Agent Runtime",
+        instance.detail?.agent_runtime?.enabled
+          ? "已启用"
+          : instance.detail?.agent_runtime?.state || "未启用",
+      ],
       ["创建时间", formatDateTime(instance.created_at)],
       ["最近检查", instance.last_checked_at ? relativeTime(instance.last_checked_at) : "—"],
     ];

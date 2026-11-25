@@ -225,6 +225,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ pool_id: poolId, count }),
     }),
+  backfillAgentRuntime: (body: { pool_id?: string; region_id?: string; limit?: number } = {}) =>
+    request<{ task_ids: string[]; count: number }>("/instances/backfill-agent-runtime", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   allocate: (id: string, body: { app_name: string; user?: string }) =>
     request<{ task_id: string; instance_id: string; bound_app_id: string }>(`/instances/${id}/allocate`, {
       method: "POST",

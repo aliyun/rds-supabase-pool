@@ -22,6 +22,7 @@ RDS Supabase Pool Console 是一个面向 RDS Supabase 的冷热资源池控制�
 - **共享 PG 管理**：选择已有 Running PG 或直接新建；支持跨 VPC/AZ 挂载、按负载选择最空闲的 PG、容量比例管理，以及移除时可选删除云上 PG。
 - **双角色边界**：管理员管理资源池与生命周期；使用者通过独立门户或 CLI 自助申请、查看连接信息并归还，全程不接触云账号凭证。
 - **真实 / Mock 双模式**：Mock 模式用于本地和演示；真实模式调用阿里云 RDS / RdsAi OpenAPI。
+- **Agent Runtime**：池级开关默认开启，新预热和未启用的实例归还时会启用沙箱和 Edge Functions。
 - **运维能力**：任务状态机、失败重试、自愈巡检、API 审计、池成本统计、SSE 实时状态。
 
 ## 架构
@@ -56,7 +57,7 @@ flowchart LR
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.1"
+export POOL_UI_RELEASE_TAG="v0.1.2"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<8~32 位，至少包含大写/小写/数字/特殊字符中的三类>"
@@ -72,7 +73,7 @@ export DINGTALK_SECRET="SEC..."   # required only for a signed robot
 ./edge/bootstrap.sh
 ```
 
-> Release 模式需要对应 GitHub Release 已上传 `pool-ui-v0.1.1.ts` 和 `.sha256`。
+> Release 模式需要对应 GitHub Release 已上传 `pool-ui-v0.1.2.ts` 和 `.sha256`。
 > 开发或尚未发布 Release 时，使用源码构建：`DEPLOY_UI=source ./edge/bootstrap.sh`（需要 Node/npm）。
 > 只更新 API：`DEPLOY_UI=0 ./edge/bootstrap.sh`。
 
@@ -113,13 +114,37 @@ export CLOUD_MODE="real"
 
 ## 已有实例升级 / 服务异常恢复
 
-已有实例无需重新执行 `bootstrap.sh`，直接执行：
+已有实例无需重新执行 `bootstrap.sh`。有 `edge/.bootstrap.env` 时直接执行：
 
 ```bash
 ./edge/upgrade.sh
 ```
 
-脚本会自动读取首次部署生成的 `edge/.bootstrap.env`，更新 `pool-api`、`pool-ui`、`pool-notifier` 和 watchdog，并执行健康检查。
+脚本会更新 `pool-api`、`pool-ui`、`pool-notifier` 和 watchdog，并执行健康检查。
+
+没有 `.bootstrap.env` 时，可以提供实例名、地域和 AK/SK：
+
+```bash
+INSTANCE_NAME="ra-xxxxxxxx" \
+REGION="cn-shanghai" \
+ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
+ALIBABA_CLOUD_ACCESS_KEY_SECRET="<SK>" \
+WORKER_TOKEN="<原 worker token>" \
+./edge/upgrade.sh
+```
+
+如果原 `WORKER_TOKEN` 已丢失，不需要找回，使用下面的命令重置：
+
+```bash
+INSTANCE_NAME="ra-xxxxxxxx" \
+REGION="cn-shanghai" \
+ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
+ALIBABA_CLOUD_ACCESS_KEY_SECRET="<SK>" \
+RESET_WORKER_TOKEN=1 \
+./edge/upgrade.sh
+```
+
+脚本会生成新 token、更新 Edge Secret、重新部署并重挂调度；升级完成后旧 token 会失效，后台任务可能暂停约 1 分钟，但不会丢失任务记录，也不会修改 JWT、数据库密码或池数据。
 
 如果只是新增或更换钉钉告警：
 
@@ -127,7 +152,7 @@ export CLOUD_MODE="real"
 DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
 ```
 
-如果 `edge/.bootstrap.env` 丢失，需要先按部署文档恢复部署配置。不要用 `bootstrap.sh` 做已有实例的升级或恢复。
+无 `.bootstrap.env` 升级成功后，脚本会把部署坐标和新 token 保存到该文件（0600，已忽略）。不要用 `bootstrap.sh` 做已有实例的升级或恢复。
 
 ## 使用者 API 与 CLI
 
@@ -153,7 +178,7 @@ poolctl release my-app --yes --wait
 - **`DINGTALK_WEBHOOK` 是外部告警开关**：设置后启用钉钉投递；未设置时 heartbeat、watchdog 和 outbox 仍工作，但不会调用 notifier，也不会影响主业务。
 - `DINGTALK_SECRET` 仅在钉钉机器人使用「加签」时需要；使用自定义关键词时可以不配置。
 - 首次部署时把这两个变量传给 `bootstrap.sh`，脚本会写入 Edge Secrets。
-- 已有实例重新部署使用 `./edge/upgrade.sh`；它会更新 `pool-api` / `pool-ui` / `pool-notifier` 并重挂 watchdog。默认不会修改 Edge Secrets；如需新增或更换 webhook，可执行：
+- 已有实例重新部署使用 `./edge/upgrade.sh`；它会更新 `pool-api` / `pool-ui` / `pool-notifier` 并重挂 watchdog。除显式 `RESET_WORKER_TOKEN=1` 外不会修改 Edge Secrets；如需新增或更换 webhook，可执行：
 
 ```bash
 DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
@@ -173,6 +198,7 @@ DINGTALK_WEBHOOK="https://..." DINGTALK_SECRET="SEC..." ./edge/upgrade.sh
 - 使用者只能看到并操作自己的实例；删除操作仅管理员可执行。
 - 默认 Mock 模式不创建业务云资源；真实模式请使用最小权限 RAM 用户，并避免长期放开 PG 白名单。
 - Supabase 实例白名单由生命周期自动维护：冷池 `127.0.0.1`，分配时按使用者 CIDR 放行，归还时先重置再停止。公网开放需要显式选择，并受池级策略控制。
+- 白名单使用独立分组 `pool_white`，不会覆盖实例的 `default` 分组及其中已有的 VPC 网段。
 - 不要在公开内容中粘贴真实凭证、实例 ID 或客户数据。
 
 ## 目录

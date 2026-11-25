@@ -93,6 +93,7 @@ All routes below require an admin session unless noted.
 | ------ | ------------------------------ | ------------------------------------------------------------------------ |
 | GET    | `/instances`                   | List instances; filters include `region_id`, `mode`, `status`, `pool_id` |
 | POST   | `/instances/prewarm`           | Prewarm one or more instances                                            |
+| POST   | `/instances/backfill-agent-runtime` | Enable Agent Runtime on eligible InCold instances                    |
 | GET    | `/instances/:id`               | Instance detail                                                          |
 | DELETE | `/instances/:id`               | Delete an instance and its cloud resources                               |
 | GET    | `/instances/:id/events`        | Instance audit timeline                                                  |
@@ -163,10 +164,11 @@ Portal endpoints are available both under `/portal/*` for session cookies and
 ## Supabase network allowlist
 
 The allowlist is managed on the Supabase application instance, not on the
-underlying PostgreSQL instance. All lifecycle writes happen while the instance
-is `Running`.
+underlying PostgreSQL instance. It uses a dedicated RdsAi whitelist group
+named `pool_white`; the instance's `default` group and its VPC rules are not
+modified. All lifecycle writes happen while the instance is `Running`.
 
-- Cold pool: `127.0.0.1`; external access is closed.
+- Cold pool: `127.0.0.1`; external access is closed for `pool_white`.
 - Restricted mode: `127.0.0.1` plus the requested application egress CIDRs.
 - Public mode: `0.0.0.0/0`; this is an explicit opt-in and can be disabled by
   the pool's `network_policy.allow_public_access`.
@@ -193,6 +195,27 @@ Apply example:
 Use `"mode": "public", "cidrs": []` for public access when allowed. A stopped
 instance cannot be modified; start it first. `0.0.0.0/0` is not accepted in
 restricted mode.
+
+Existing instances that were previously managed through the `default` group
+must be migrated manually: restore the platform/VPC rules in `default`, then
+let the new lifecycle manage `pool_white`. The control plane never rewrites
+`default`.
+
+## Agent Runtime
+
+Pools enable Agent Runtime by default for newly prewarmed Supabase instances; set `agent_runtime_enabled` to `false` to opt out:
+
+```json
+{
+  "agent_runtime_enabled": true
+}
+```
+
+When enabled, prewarm waits for Supabase to become `Running`, calls
+`EnableAgentRuntime`, then waits for the `agent-runtime` component to become
+active before closing the network allowlist and stopping the instance. This
+adds roughly 2-5 minutes to prewarm time and may create a VPC endpoint and
+security group on first use in a VPC. The setting applies to new prewarm tasks and conditional enablement during return. Existing InCold instances can be backfilled with `POST /instances/backfill-agent-runtime`; InUse instances are handled on normal return.
 
 ## Task model
 

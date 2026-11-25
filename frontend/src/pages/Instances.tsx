@@ -29,6 +29,7 @@ export function InstancesPage() {
   const [confirmTarget, setConfirmTarget] = useState<{ instance: Instance; action: "stop" | "start" } | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [selfhealLoading, setSelfhealLoading] = useState(false);
+  const [runtimeBackfillLoading, setRuntimeBackfillLoading] = useState(false);
 
   const filtered = useMemo(() => {
     return instances.filter((instance) => {
@@ -87,6 +88,23 @@ export function InstancesPage() {
     }
   };
 
+  const runtimeBackfillCandidates = instances.filter(
+    (instance) => instance.status === "InCold" && instance.detail?.agent_runtime?.enabled !== true,
+  ).length;
+
+  const runAgentRuntimeBackfill = async () => {
+    setRuntimeBackfillLoading(true);
+    try {
+      const result = await api.backfillAgentRuntime();
+      push("success", `已提交 ${result.count} 个 Agent Runtime 启用任务`);
+      await refreshAll();
+    } catch (error) {
+      push("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setRuntimeBackfillLoading(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       {loading && !overview ? (
@@ -118,6 +136,15 @@ export function InstancesPage() {
                 onClick={() => void runSelfheal()}
               >
                 自愈巡检
+              </Button>
+              <Button
+                variant="secondary"
+                icon={<Play size={14} />}
+                loading={runtimeBackfillLoading}
+                disabled={runtimeBackfillCandidates === 0}
+                onClick={() => void runAgentRuntimeBackfill()}
+              >
+                启用 Agent Runtime{runtimeBackfillCandidates ? ` (${runtimeBackfillCandidates})` : ""}
               </Button>
               <Button
                 variant="primary"

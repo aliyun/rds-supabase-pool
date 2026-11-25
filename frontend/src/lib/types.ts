@@ -45,6 +45,7 @@ export interface PoolSettings {
   single_pg_security_ips: string;
   public_endpoint_enabled: boolean;
   network_policy: NetworkPolicy;
+  agent_runtime_enabled: boolean;
 }
 
 export interface MetadataPgSettings {
@@ -399,6 +400,7 @@ export interface InstanceDetail {
   reserved?: boolean;
   reserved_app_name?: string;
   network?: InstanceNetwork;
+  agent_runtime?: { enabled: boolean; state: string; last_error?: string };
   [key: string]: unknown;
 }
 

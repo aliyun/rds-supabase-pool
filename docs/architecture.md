@@ -125,17 +125,18 @@ pg_cron（每分钟）
 ### 实例生命周期
 
 ```text
-预热 Creating → wait_running → close_network → stop → InCold
+预热 Creating → wait_running → [enable_agent_runtime → wait_agent_runtime] → close_network → stop → InCold
 申请：InCold/Available → start（如需要）→ wait_running → apply_network → InUse
-归还：InUse → reset_network（Cover 127.0.0.1）→ stop → InCold（保留给同名应用）
+归还：InUse → reset_network（Cover 127.0.0.1）→ [enable_agent_runtime → wait_agent_runtime] → stop → InCold（保留给同名应用）
 删除：InCold/InUse → delete_supabase → Deleted
 ```
 
 Supabase 实例网络白名单由任务状态机维护：
 
 - 冷池统一 `127.0.0.1`。
-- 分配时按使用者选择的 `restricted`/`public` 模式 Cover 目标白名单。
-- 归还时先 Cover 回 `127.0.0.1` 并读取校验，再停止实例。
+- 分配时按使用者选择的 `restricted`/`public` 模式 Cover `pool_white` 分组。
+- 归还时先 Cover `pool_white` 回 `127.0.0.1` 并读取校验，再停止实例。
+- `pool_white` 与实例 `default` 分组隔离，后者中的 VPC 网段保持不变。
 - Stopped 状态不能修改白名单，因此所有写入都必须在 Running 窗口完成。
 - 详细状态和失败处理见 `docs/api.md`。
 
