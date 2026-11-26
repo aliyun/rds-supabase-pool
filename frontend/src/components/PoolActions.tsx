@@ -117,15 +117,18 @@ export function PrewarmModal({
                 </Badge>
               </div>
               <div className="mt-1 text-[11px] text-slate-500">{item.subtitle}</div>
-              <div className="mt-3 flex items-center gap-3 text-[10px] text-slate-500">
+              <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-slate-500">
                 <span>
                   冷池 <span className="mono text-slate-300">{item.stats?.cold ?? 0}</span>
                 </span>
                 <span>
-                  使用中 <span className="mono text-slate-300">{item.stats?.in_use ?? 0}</span>
+                  可用 <span className="mono text-slate-300">{item.stats?.available ?? 0}</span>
                 </span>
                 <span>
-                  水位 <span className="mono text-slate-300">{item.stats?.target ?? 0}</span>
+                  目标空闲 <span className="mono text-slate-300">{item.stats?.target ?? 0}</span>
+                </span>
+                <span>
+                  使用中 <span className="mono text-slate-300">{item.stats?.in_use ?? 0}</span>
                 </span>
               </div>
             </button>

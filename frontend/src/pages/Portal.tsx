@@ -229,7 +229,7 @@ export function PortalApp() {
                             </span>
                           </div>
                           <div className="mt-1 truncate text-[10px] text-slate-500">
-                            {pool.pool_name} · 使用中 {pool.in_use} · 目标 {pool.target}
+                            {pool.pool_name} · 使用中 {pool.in_use} · 目标空闲 {pool.target}
                           </div>
                         </div>
                         <Button
@@ -244,7 +244,7 @@ export function PortalApp() {
                     ))}
                   </div>
                   <div className="mt-2 flex items-center justify-between text-[10px] text-slate-600">
-                    <span>目标水位合计 {region.target}</span>
+                    <span>目标空闲合计 {region.target}</span>
                     <span>
                       可申请合计 <span className="mono text-slate-400">{region.available}</span>
                     </span>
@@ -661,7 +661,7 @@ function ApplyModal({
         </Field>
         {selectedPool ? (
           <div className="grid grid-cols-3 gap-2 rounded-xl border border-edge bg-white/[0.02] p-3">
-            <MiniMetric label="目标水位" value={selectedPool.target} tone="slate" />
+            <MiniMetric label="目标空闲" value={selectedPool.target} tone="slate" />
             <MiniMetric
               label="可申请冷池"
               value={selectedPool.available}

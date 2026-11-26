@@ -35,7 +35,7 @@ export function DashboardPage() {
   const total = overview?.instance_total ?? 0;
   const singlePool = overview?.pools?.single;
   const sharedPool = overview?.pools?.shared;
-  const cold = (singlePool?.cold ?? 0) + (sharedPool?.cold ?? 0);
+  const available = (singlePool?.available ?? 0) + (sharedPool?.available ?? 0);
   const inUse = (singlePool?.in_use ?? 0) + (sharedPool?.in_use ?? 0);
   const failed = (singlePool?.failed ?? 0) + (sharedPool?.failed ?? 0);
   const target = (singlePool?.target ?? 0) + (sharedPool?.target ?? 0);
@@ -119,8 +119,8 @@ export function DashboardPage() {
           delay="0ms"
         />
         <StatCard
-          label="冷池水位"
-          value={`${cold} / ${target}`}
+          label="可用空闲"
+          value={`${available} / ${target}`}
           sub="可被立即分配的实例"
           icon={<Snowflake size={16} />}
           tone="sky"
@@ -148,7 +148,7 @@ export function DashboardPage() {
         {(["single", "shared"] as PoolMode[]).map((mode, index) => {
           const pool = overview?.pools?.[mode];
           const modeMeta = MODE_META[mode];
-          const percentage = pool && pool.target > 0 ? Math.round((pool.cold / pool.target) * 100) : 0;
+          const percentage = pool && pool.target > 0 ? Math.round((pool.available / pool.target) * 100) : 0;
           return (
             <Card
               key={mode}
@@ -175,7 +175,7 @@ export function DashboardPage() {
               </div>
               <div className="mt-4 flex flex-col items-center gap-5 sm:flex-row sm:items-center">
                 <PoolGauge
-                  cold={pool?.cold ?? 0}
+                  available={pool?.available ?? 0}
                   target={pool?.target ?? 0}
                   total={pool?.total ?? 0}
                   max={pool?.max ?? 0}
@@ -185,7 +185,7 @@ export function DashboardPage() {
                 <div className="w-full flex-1 space-y-4">
                   <div>
                     <div className="mb-1.5 flex items-center justify-between text-[11px]">
-                      <span className="text-slate-500">冷池水位达成</span>
+                      <span className="text-slate-500">可用空闲达成</span>
                       <span className={cx("mono", percentage >= 100 ? "text-acid" : "text-cyan-300")}>
                         {percentage}%
                       </span>

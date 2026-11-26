@@ -179,6 +179,7 @@ export interface PoolSummary {
   by_status: Record<string, number>;
   cold: number;
   reserved: number;
+  available: number;
   in_use: number;
   creating: number;
   failed: number;

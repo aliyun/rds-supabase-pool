@@ -1,7 +1,7 @@
 import { cx, STATUS_META } from "../lib/format";
 
 export function PoolGauge({
-  cold,
+  available,
   target,
   total,
   max,
@@ -9,7 +9,7 @@ export function PoolGauge({
   accent,
   size = 196,
 }: {
-  cold: number;
+  available: number;
   target: number;
   total: number;
   max: number;
@@ -24,7 +24,7 @@ export function PoolGauge({
   const cInner = 2 * Math.PI * rInner;
   const sweep = 0.75;
   const outerFraction = max > 0 ? Math.min(1, total / max) : 0;
-  const innerFraction = target > 0 ? Math.min(1, cold / target) : 0;
+  const innerFraction = target > 0 ? Math.min(1, available / target) : 0;
   const outerColor = accent === "cyan" ? "#22d3ee" : "#818cf8";
   const innerColor = accent === "cyan" ? "#a3e635" : "#22d3ee";
 
@@ -100,10 +100,10 @@ export function PoolGauge({
         })}
       </svg>
       <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <div className="label-eyebrow">COLD READY</div>
+        <div className="label-eyebrow">IDLE READY</div>
         <div className="display-title mt-1 flex items-baseline gap-1 text-white">
           <span className="text-4xl font-semibold leading-none" style={{ color: innerColor }}>
-            {cold}
+            {available}
           </span>
           <span className="text-sm text-slate-500">/ {target}</span>
         </div>

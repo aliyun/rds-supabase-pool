@@ -497,7 +497,7 @@ function RegionCard({
 
 function PoolTile({ pool, onEdit }: { pool: RegionPool; onEdit: () => void }) {
   const meta = MODE_META[pool.mode];
-  const percentage = pool.target > 0 ? Math.min(100, Math.round((pool.cold / pool.target) * 100)) : 0;
+  const percentage = pool.target > 0 ? Math.min(100, Math.round((pool.available / pool.target) * 100)) : 0;
   return (
     <div
       className={cx(
@@ -514,7 +514,7 @@ function PoolTile({ pool, onEdit }: { pool: RegionPool; onEdit: () => void }) {
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-3 text-[10px] text-slate-500">
             <span>
-              目标 <span className="mono text-slate-300">{pool.target}</span>
+              目标空闲 <span className="mono text-slate-300">{pool.target}</span>
             </span>
             <span>
               上限 <span className="mono text-slate-300">{pool.max}</span>
@@ -551,7 +551,7 @@ function PoolTile({ pool, onEdit }: { pool: RegionPool; onEdit: () => void }) {
       </div>
       <div className="mt-3">
         <div className="mb-1 flex items-center justify-between text-[10px] text-slate-500">
-          <span>冷池水位</span>
+          <span>可用空闲水位</span>
           <span className="mono">{percentage}%</span>
         </div>
         <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
@@ -559,6 +559,12 @@ function PoolTile({ pool, onEdit }: { pool: RegionPool; onEdit: () => void }) {
             className={cx("h-full rounded-full transition-all", pool.mode === "single" ? "bg-cyan-400" : "bg-violet")}
             style={{ width: `${percentage}%` }}
           />
+        </div>
+        <div className="mt-1 text-[10px] text-slate-600">
+          可用 <span className="mono text-slate-400">{pool.available}</span> / 目标{" "}
+          <span className="mono text-slate-400">{pool.target}</span>，冷池{" "}
+          <span className="mono text-slate-400">{pool.cold}</span>，保留{" "}
+          <span className="mono text-slate-400">{pool.reserved}</span>
         </div>
       </div>
       <div className="mt-3 grid gap-1 text-[10px] text-slate-500">
@@ -657,7 +663,7 @@ function PoolConfigModal({ pool, onClose, onSaved }: { pool: RegionPool; onClose
 
   const save = async () => {
     if (config.target > config.max) {
-      push("error", "目标水位不能大于最大实例数");
+      push("error", "目标空闲实例数不能大于最大实例数");
       return;
     }
     setSaving(true);
@@ -767,7 +773,7 @@ function PoolConfigModal({ pool, onClose, onSaved }: { pool: RegionPool; onClose
         <div className="rounded-xl border border-edge bg-white/[0.02] p-4">
           <div className="display-title text-xs text-slate-200">水位与调度</div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            <Field label="目标水位">
+            <Field label="目标空闲实例数" hint="池内可分配空闲实例的目标值；总实例数仍受最大实例数限制">
               <Input
                 type="number"
                 min={0}
@@ -1154,7 +1160,7 @@ function AddRegionModal({
           </Field>
         </div>
         <div className="rounded-lg border border-edge bg-white/[0.02] px-3 py-2.5 text-[11px] leading-5 text-slate-500">
-          新增地域后，可继续在两张池卡片中调整目标水位、自动补货与单租 PG 规格，并为共享池添加已有 PG。
+          新增地域后，可继续在两张池卡片中调整目标空闲实例数、自动补货与单租 PG 规格，并为共享池添加已有 PG。
         </div>
       </div>
     </Modal>

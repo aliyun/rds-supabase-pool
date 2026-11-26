@@ -104,10 +104,10 @@ export function GlobalOverviewPage() {
           {summaries.map((item, index) => {
             const single = item.pools.single;
             const shared = item.pools.shared;
-            const cold = (single?.cold ?? 0) + (shared?.cold ?? 0);
+            const available = (single?.available ?? 0) + (shared?.available ?? 0);
             const inUse = (single?.in_use ?? 0) + (shared?.in_use ?? 0);
             const target = (single?.target ?? 0) + (shared?.target ?? 0);
-            const progress = target > 0 ? Math.min(100, Math.round((cold / target) * 100)) : 0;
+            const progress = target > 0 ? Math.min(100, Math.round((available / target) * 100)) : 0;
             return (
               <Card
                 key={item.region_id}
@@ -149,7 +149,7 @@ export function GlobalOverviewPage() {
                     实例 <span className="mono text-slate-200">{item.instance_total}</span>
                   </span>
                   <span>
-                    冷池 <span className="mono text-sky-300">{cold}</span>
+                    可用空闲 <span className="mono text-sky-300">{available}</span>
                     <span className="text-slate-600"> / {target}</span>
                   </span>
                   <span>
@@ -269,7 +269,7 @@ function PoolMini({ mode, pool }: { mode: PoolMode; pool?: PoolSummary }) {
           <Flame size={11} className="text-violet" />
         )}
         <span className="text-[10px] text-slate-500">
-          冷池 <span className="mono text-slate-300">{pool?.cold ?? 0}</span> / 目标{" "}
+          可用 <span className="mono text-slate-300">{pool?.available ?? 0}</span> / 目标空闲{" "}
           <span className="mono text-slate-300">{pool?.target ?? 0}</span>
         </span>
       </div>

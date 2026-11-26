@@ -761,7 +761,7 @@ export function SettingsPage() {
             <span className="display-title text-sm text-slate-200">地域与资源池</span>
           </div>
           <p className="mt-3 text-[11px] leading-6 text-slate-400">
-            每个地域维护独立的单租户池和多租共享池。目标水位、最大实例数、自动补货、释放策略、冻结方式与网络都在
+            每个地域维护独立的单租户池和多租共享池。目标空闲实例数、最大实例数、自动补货、释放策略、冻结方式与网络都在
             「地域与资源池」页面按池配置。
           </p>
           <ul className="mt-3 space-y-2 text-[11px] leading-6 text-slate-500">

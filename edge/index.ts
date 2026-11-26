@@ -229,7 +229,18 @@ async function requireAdmin(req: Request) {
   return ctx;
 }
 
-function poolStats(rows: any[]) {
+function isAvailableIdle(row: any, studioRequired: boolean): boolean {
+  const detail = parseObject(row.detail);
+  return row.status === "InCold"
+    && !row.owner_user_id
+    && detail.reserved !== true
+    && detail.reserved !== "true"
+    && detail.studio_rotation_pending !== true
+    && detail.studio_rotation_pending !== "true"
+    && (!studioRequired || row.credential_ready === true);
+}
+
+function poolStats(rows: any[], studioRequired = false) {
   const byStatus: Record<string, number> = {};
   let reserved = 0;
   for (const row of rows) {
@@ -242,6 +253,7 @@ function poolStats(rows: any[]) {
     by_status: byStatus,
     cold: byStatus.InCold || 0,
     reserved,
+    available: rows.filter((row) => isAvailableIdle(row, studioRequired)).length,
     in_use: byStatus.InUse || 0,
     creating: byStatus.Creating || 0,
     failed: byStatus.Failed || 0,
@@ -251,7 +263,14 @@ function poolStats(rows: any[]) {
 async function regionsPayload() {
   const regions = await sql`select * from regions order by region_id`;
   const pools = await sql`select * from pools order by region_id, mode`;
-  const instances = await sql`select pool_id, status, detail from pool_instances where is_deleted = false`;
+  const instances = await sql`
+    select i.pool_id, i.status, i.detail, i.id, i.owner_user_id,
+      exists (
+        select 1 from instance_credentials c
+        where c.instance_id = i.id and c.initialized = true
+      ) as credential_ready
+    from pool_instances i where i.is_deleted = false
+  `;
   const shared = await sql`select pg_instance_id, pool_id, name, region_id, status, enabled, reserved_slots, capacity from shared_pgs`;
   return regions.map((region: any) => ({
     ...region,
@@ -264,9 +283,9 @@ async function regionsPayload() {
         ...pool,
         enabled: !!pool.enabled,
         config,
-        target: Number(config.target || 2),
-        max: Number(config.max || 4),
-        ...poolStats(subset),
+        target: Number(config.target ?? 2),
+        max: Number(config.max ?? 4),
+        ...poolStats(subset, config.allow_user_studio !== false),
         shared_pg_count: shared.filter((item: any) => item.pool_id === pool.id).length,
       };
     }),
@@ -289,7 +308,7 @@ async function portalRegions() {
           pool_name: pool.name,
           cold: pool.cold,
           reserved: pool.reserved,
-          available: Math.max(0, pool.cold - pool.reserved),
+          available: pool.available,
           in_use: pool.in_use,
           target: pool.target,
           max: pool.max,
@@ -2609,6 +2628,7 @@ async function overviewPayload(requestedRegionId = "") {
           by_status: {},
           cold: 0,
           reserved: 0,
+          available: 0,
           in_use: 0,
           creating: 0,
           failed: 0,
@@ -3835,10 +3855,29 @@ async function enqueuePrewarm(pool: any, count: number): Promise<string[]> {
   return taskIds;
 }
 
+async function sharedPoolCapacityHeadroom(poolId: string, total: number): Promise<number> {
+  const rows = await sql`
+    select capacity from shared_pgs
+    where pool_id = ${poolId} and enabled = true and status = 'Running'
+  `;
+  let capacityTotal = 0;
+  let known = false;
+  for (const row of rows) {
+    const capacity = parseObject(row.capacity);
+    const maximum = Number(capacity.estimated_max_total_tenants || 0);
+    if (Number.isFinite(maximum) && maximum > 0) {
+      capacityTotal += maximum;
+      known = true;
+    }
+  }
+  if (!known) return Number.POSITIVE_INFINITY;
+  return Math.max(0, capacityTotal - total);
+}
+
 async function maybeAutoRefill() {
   const rows = await sql`select * from pools where enabled = true`;
   for (const row of rows) {
-    const config = parseObject(row.config);
+    const config = poolConfig(row.config);
     if (!config.auto_refill) continue;
     const pending = await sql`select count(*)::int as total from tasks where pool_id = ${row.id} and kind = 'prewarm' and status in ('pending','running')`;
     if (Number(pending[0].total) > 0) continue;
@@ -3846,8 +3885,24 @@ async function maybeAutoRefill() {
       const shared = await sql`select count(*)::int as total from shared_pgs where pool_id = ${row.id} and enabled = true and status = 'Running'`;
       if (Number(shared[0].total) === 0) continue;
     }
-    const countRows = await sql`select count(*)::int as total from pool_instances where pool_id = ${row.id} and is_deleted = false`;
-    const remaining = Math.min(Number(config.target || 2), Number(config.max || 4)) - Number(countRows[0].total);
+    const instances = await sql`
+      select i.id, i.status, i.owner_user_id, i.detail,
+        exists (
+          select 1 from instance_credentials c
+          where c.instance_id = i.id and c.initialized = true
+        ) as credential_ready
+      from pool_instances i
+      where i.pool_id = ${row.id} and i.is_deleted = false
+    `;
+    const studioRequired = config.allow_user_studio !== false;
+    const total = instances.length;
+    const available = instances.filter((inst: any) => isAvailableIdle(inst, studioRequired)).length;
+    const target = Math.max(0, Number(config.target ?? 2));
+    const maximum = Math.max(0, Number(config.max ?? 4));
+    let remaining = Math.min(Math.max(0, target - available), Math.max(0, maximum - total));
+    if (row.mode === "shared" && remaining > 0) {
+      remaining = Math.min(remaining, await sharedPoolCapacityHeadroom(row.id, total));
+    }
     if (remaining > 0) await enqueuePrewarm(row, Math.min(remaining, 2));
   }
 }
@@ -5095,7 +5150,7 @@ async function handler(req: Request): Promise<Response> {
       } catch (err) {
         return error(`单租 PG 标签无效：${String(err)}`, 400);
       }
-      if (Number(nextConfig.target) > Number(nextConfig.max)) return error("目标水位不能大于最大实例数");
+      if (Number(nextConfig.target) > Number(nextConfig.max)) return error("目标空闲实例数不能大于最大实例数");
       await sql`
         update pools set
           name = ${body.name ?? pool.name},
