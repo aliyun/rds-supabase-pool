@@ -6,6 +6,8 @@ let activeControlDbUrl = ENV_CONTROL_DB_URL;
 let sql = postgres(activeControlDbUrl, { max: 1, prepare: false });
 const JWT_SECRET = Deno.env.get("PLATFORM_JWT_SECRET") || "";
 if (!JWT_SECRET) throw new Error("PLATFORM_JWT_SECRET 未配置");
+const STUDIO_USERNAME = "supabase";
+const STUDIO_KEY_VERSION = 1;
 let CLOUD_MODE = Deno.env.get("CLOUD_MODE") || "mock";
 const TOKEN_TTL = 7 * 24 * 3600;
 const SCOPES = ["instances:read", "instances:apply", "instances:release", "credentials:read", "network:read", "network:write"];
@@ -418,6 +420,119 @@ function parseObject(value: unknown): Record<string, any> {
   return {};
 }
 
+let studioCredentialKeyPromise: Promise<CryptoKey> | null = null;
+
+async function studioCredentialKey(): Promise<CryptoKey> {
+  if (!studioCredentialKeyPromise) {
+    studioCredentialKeyPromise = (async () => {
+      const material = await crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(JWT_SECRET),
+        "HKDF",
+        false,
+        ["deriveKey"],
+      );
+      return await crypto.subtle.deriveKey(
+        {
+          name: "HKDF",
+          hash: "SHA-256",
+          salt: new TextEncoder().encode("rds-supabase-pool"),
+          info: new TextEncoder().encode("studio-credentials-v1"),
+        },
+        material,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["encrypt", "decrypt"],
+      );
+    })();
+  }
+  return await studioCredentialKeyPromise;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let text = "";
+  for (const byte of bytes) text += String.fromCharCode(byte);
+  return btoa(text);
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const text = atob(value);
+  return Uint8Array.from(text, (char) => char.charCodeAt(0));
+}
+
+async function encryptStudioPassword(password: string): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    await studioCredentialKey(),
+    new TextEncoder().encode(password),
+  );
+  const combined = new Uint8Array(iv.length + encrypted.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(encrypted), iv.length);
+  return bytesToBase64(combined);
+}
+
+async function decryptStudioPassword(value: string): Promise<string> {
+  const bytes = base64ToBytes(value);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: bytes.slice(0, 12) },
+    await studioCredentialKey(),
+    bytes.slice(12),
+  );
+  return new TextDecoder().decode(decrypted);
+}
+
+function randomStudioPassword(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
+  const bytes = crypto.getRandomValues(new Uint8Array(20));
+  let value = "Aa1_";
+  for (const byte of bytes) value += chars[byte % chars.length];
+  return value;
+}
+
+async function saveStudioCredential(
+  instanceId: string,
+  password: string,
+  initialized: boolean,
+  actor: string,
+) {
+  const encrypted = await encryptStudioPassword(password);
+  await sql`
+    insert into instance_credentials
+      (instance_id, studio_username, studio_password_enc, initialized, key_version, updated_at, updated_by)
+    values
+      (${instanceId}, ${STUDIO_USERNAME}, ${encrypted}, ${initialized}, ${STUDIO_KEY_VERSION}, now(), ${actor})
+    on conflict (instance_id) do update set
+      studio_username = excluded.studio_username,
+      studio_password_enc = excluded.studio_password_enc,
+      initialized = excluded.initialized,
+      key_version = excluded.key_version,
+      updated_at = now(),
+      updated_by = excluded.updated_by
+  `;
+}
+
+async function readStudioCredential(instanceId: string) {
+  const rows = await sql`select * from instance_credentials where instance_id = ${instanceId} limit 1`;
+  const row: any = rows[0];
+  if (!row) return null;
+  return {
+    instance_id: row.instance_id,
+    username: row.studio_username || STUDIO_USERNAME,
+    password: await decryptStudioPassword(String(row.studio_password_enc || "")),
+    initialized: !!row.initialized,
+  };
+}
+
+async function rotateStudioCredential(inst: any, adapter: any, actor: string): Promise<string> {
+  const password = randomStudioPassword();
+  await saveStudioCredential(inst.id, password, false, actor);
+  await adapter.resetStudioPassword(inst.supabase_instance_id, password);
+  await saveStudioCredential(inst.id, password, true, actor);
+  return password;
+}
+
 function normalizeIpv4Cidr(value: unknown): string {
   const text = String(value || "").trim();
   if (!text) throw new Error("IP/CIDR 不能为空");
@@ -449,6 +564,50 @@ function normalizeNetworkCidrs(value: unknown, max = 8): string[] {
 
 function isPublicCidr(cidr: string): boolean {
   return cidr === "0.0.0.0/0";
+}
+
+type PgTag = { key: string; value: string };
+
+function normalizePgTags(value: unknown): PgTag[] {
+  let raw = value;
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      raw = [];
+    }
+  }
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const tags: PgTag[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const key = String((item as any).key ?? (item as any).Key ?? "").trim();
+    if (!key) throw new Error("PG 标签键不能为空");
+    if (seen.has(key)) throw new Error(`PG 标签键重复：${key}`);
+    const value = String((item as any).value ?? (item as any).Value ?? "").trim();
+    seen.add(key);
+    tags.push({ key, value });
+  }
+  if (tags.length > 20) throw new Error("每个 PG 最多允许 20 个标签");
+  return tags;
+}
+
+function safePgTags(value: unknown): PgTag[] {
+  try {
+    return normalizePgTags(value);
+  } catch {
+    return [];
+  }
+}
+
+function pgTagParams(tags: PgTag[]): Record<string, string> {
+  const params: Record<string, string> = { ResourceType: "INSTANCE" };
+  tags.forEach((tag, index) => {
+    params[`Tag.${index + 1}.Key`] = tag.key;
+    params[`Tag.${index + 1}.Value`] = tag.value;
+  });
+  return params;
 }
 
 function networkPolicy(config: Record<string, any>): { allow_user_edit: boolean; allow_public_access: boolean; max_cidrs: number } {
@@ -548,6 +707,65 @@ function agentRuntimeEnabled(components: unknown): boolean {
     const status = String(item?.Status || item?.status || "").toLowerCase();
     return type === "agent-runtime" && ["enable", "enabled", "running"].includes(status);
   });
+}
+
+async function studioCredentialInitialized(instanceId: string): Promise<boolean> {
+  const rows = await sql`select initialized from instance_credentials where instance_id = ${instanceId} limit 1`;
+  return !!rows[0]?.initialized;
+}
+
+async function studioAllocationGuard(inst: any, pool: any): Promise<string> {
+  const config = poolConfig(pool?.config);
+  if (config.allow_user_studio === false) return "";
+  const detail = parseObject(inst.detail);
+  if (detail.studio_rotation_pending === true) return "Studio 凭据轮换尚未完成，暂不可分配";
+  if (!(await studioCredentialInitialized(inst.id))) {
+    return "该实例尚未初始化 Studio 凭据，请管理员先执行初始化";
+  }
+  return "";
+}
+
+async function studioAccessPayload(adapter: any, inst: any, config: Record<string, any>) {
+  if (!inst.supabase_instance_id) {
+    return {
+      studio_url: "",
+      studio_username: STUDIO_USERNAME,
+      studio_available: false,
+      agent_runtime_url: "",
+      agent_runtime_available: false,
+    };
+  }
+  let base = "";
+  try {
+    const endpoints = await adapter.supabaseEndpoints(inst.supabase_instance_id);
+    const publicEndpoint = (endpoints.instance_endpoints || []).find(
+      (item: any) => String(item.ip_type || "").toLowerCase() === "public"
+        && String(item.port) === "443"
+        && String(item.domain || "") !== "",
+    );
+    if (publicEndpoint) base = `https://${String(publicEndpoint.domain).replace(/\/$/, "")}`;
+  } catch {
+    base = "";
+  }
+  let runtimeReady = false;
+  if (base) {
+    try {
+      const cloud = await adapter.describeSupabase(inst.supabase_instance_id);
+      runtimeReady = agentRuntimeEnabled(cloud.components);
+    } catch {
+      runtimeReady = false;
+    }
+  }
+  const studioEnabled = config.allow_user_studio !== false;
+  const agentRuntimeAllowed = config.allow_user_agent_runtime !== false;
+  const credentialReady = base && studioEnabled ? await studioCredentialInitialized(inst.id) : false;
+  return {
+    studio_url: base && studioEnabled ? `${base}/` : "",
+    studio_username: STUDIO_USERNAME,
+    studio_available: !!base && studioEnabled && credentialReady,
+    agent_runtime_url: base && agentRuntimeAllowed ? `${base}/agent-runtime` : "",
+    agent_runtime_available: !!base && agentRuntimeAllowed && runtimeReady,
+  };
 }
 
 function maskSecret(value: string) {
@@ -867,6 +1085,7 @@ class RealAdapter {
       instance_name: instanceName,
       instance_endpoints: (Array.isArray(items) ? items : [items]).map((item: any) => ({
         connection_string: item.ConnectionString || "",
+        domain: item.Domain || "",
         ip: item.IP || item.Ip || "",
         port: item.Port || "",
         ip_type: item.IpType || item.IPType || "",
@@ -954,7 +1173,7 @@ class RealAdapter {
 
   async createPg(spec: Record<string, any>): Promise<string> {
     const category = String(spec.category || "Basic");
-    const data = await this.rds("CreateDBInstance", {
+    const body: Record<string, any> = {
       Engine: "PostgreSQL",
       EngineVersion: spec.engine_version || "17.0",
       DBInstanceClass: spec.instance_class || "pg.n2.2c.1m",
@@ -971,9 +1190,58 @@ class RealAdapter {
       SecurityIPList: spec.security_ip_list || "127.0.0.1",
       DBInstanceDescription: spec.description || "pool-edge",
       ClientToken: spec.client_token || randomId(),
+    };
+    const tags = normalizePgTags(spec.tags);
+    tags.forEach((tag, index) => {
+      body[`Tag.${index + 1}.Key`] = tag.key;
+      body[`Tag.${index + 1}.Value`] = tag.value;
     });
+    const data = await this.rds("CreateDBInstance", body);
     if (!data.DBInstanceId) throw new CloudApiError("CreateDBInstanceFailed", "CreateDBInstance 未返回实例 ID");
     return String(data.DBInstanceId);
+  }
+
+  async pgTags(pgId: string): Promise<PgTag[]> {
+    const data = await this.rds("ListTagResources", {
+      ResourceType: "INSTANCE",
+      "ResourceId.1": pgId,
+    });
+    const items = data.TagResources?.TagResource || data.TagResources || [];
+    const list = Array.isArray(items) ? items : [items];
+    return list
+      .filter((item: any) => String(item.ResourceId || "") === pgId)
+      .map((item: any) => ({ key: String(item.TagKey || ""), value: String(item.TagValue ?? "") }))
+      .filter((tag: PgTag) => !!tag.key);
+  }
+
+  async replacePgTags(pgId: string, tags: PgTag[]): Promise<PgTag[]> {
+    const desired = normalizePgTags(tags);
+    const current = await this.pgTags(pgId);
+    const desiredKeys = new Set(desired.map((tag) => tag.key));
+    const removed = current.filter((tag) => !desiredKeys.has(tag.key)).map((tag) => tag.key);
+    if (desired.length) {
+      await this.rds("TagResources", {
+        ...pgTagParams(desired),
+        "ResourceId.1": pgId,
+      });
+    }
+    if (removed.length) {
+      const body: Record<string, string> = { ResourceType: "INSTANCE", "ResourceId.1": pgId };
+      removed.forEach((key, index) => {
+        body[`TagKey.${index + 1}`] = key;
+      });
+      await this.rds("UntagResources", body);
+    }
+    let observed: PgTag[] = [];
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      observed = await this.pgTags(pgId);
+      const same = observed.length === desired.length && desired.every((tag) =>
+        observed.some((item) => item.key === tag.key && item.value === tag.value)
+      );
+      if (same) return observed;
+      if (attempt < 2) await sleep(800);
+    }
+    throw new Error(`PG 标签同步未生效（期望 ${desired.length}，实际 ${observed.length}）`);
   }
 
   async describePg(pgId: string) {
@@ -1036,6 +1304,13 @@ class RealAdapter {
     await this.rdsai("RestartInstance", { InstanceName: instanceName });
   }
 
+  async resetStudioPassword(instanceName: string, password: string) {
+    await this.rdsai("ResetInstancePassword", {
+      InstanceName: instanceName,
+      DashboardPassword: password,
+    });
+  }
+
   async stopSupabase(instanceName: string, force = false) {
     const body: Record<string, any> = { InstanceName: instanceName };
     if (force) body.Force = true;
@@ -1055,6 +1330,7 @@ class MockAdapter {
   mode = "mock";
   static mockWhitelists = new Map<string, string[]>();
   static mockAgentRuntime = new Set<string>();
+  static mockPgTags = new Map<string, PgTag[]>();
   constructor(public region: string) {}  async listVpcs() {
     return [{ vpc_id: "vpc-mock-01", name: "Mock VPC", cidr: "172.16.0.0/12", status: "Available", region_id: this.region }];
   }
@@ -1073,7 +1349,17 @@ class MockAdapter {
     return { pg_instance_id: pgId, public_connection: "mock-pg.pg.rds.aliyuncs.com", public_port: 5432, vpc_connection: "172.16.0.10", vpc_port: 5432, whitelist: ["127.0.0.1"] };
   }
   async createPg(spec: Record<string, any>) {
-    return randomId("pgm-mock-");
+    const pgId = randomId("pgm-mock-");
+    MockAdapter.mockPgTags.set(pgId, normalizePgTags(spec.tags));
+    return pgId;
+  }
+  async pgTags(pgId: string) {
+    return [...(MockAdapter.mockPgTags.get(pgId) || [])];
+  }
+  async replacePgTags(pgId: string, tags: PgTag[]) {
+    const normalized = normalizePgTags(tags);
+    MockAdapter.mockPgTags.set(pgId, normalized);
+    return [...normalized];
   }
   async describePg(pgId: string) {
     return { pg_instance_id: pgId, status: "Running", vpc_id: "vpc-mock-01", vswitch_id: "vsw-mock-01", zone_id: "cn-chengdu-a" };
@@ -1100,10 +1386,11 @@ class MockAdapter {
   }
   async startSupabase(_instanceName: string) {}
   async restartSupabase(_instanceName: string) {}
+  async resetStudioPassword(_instanceName: string, _password: string) {}
   async stopSupabase(_instanceName: string, _force = false) {}
   async deleteSupabase(_instanceName: string) {}
   async supabaseEndpoints(instanceName: string) {
-    return { instance_name: instanceName, instance_endpoints: [{ connection_string: "mock.supabase.rds.aliyuncs.com:443", ip: "127.0.0.1", port: "443", ip_type: "Public" }] };
+    return { instance_name: instanceName, instance_endpoints: [{ connection_string: "mock.supabase.rds.aliyuncs.com:443", domain: "mock.supabase.rds.aliyuncs.com", ip: "127.0.0.1", port: "443", ip_type: "Public" }] };
   }
   async supabaseWhitelist(instanceName: string) {
     const cidrs = MockAdapter.mockWhitelists.get(instanceName) || ["0.0.0.0/0"];
@@ -1152,6 +1439,8 @@ const MOCK_ACTION_MAP: Record<string, [string, string]> = {
   pgNet: ["DescribeDBInstanceNetInfo", "RDS"],
   pgWhitelist: ["DescribeDBInstanceIPArrayList", "RDS"],
   createPg: ["CreateDBInstance", "RDS"],
+  pgTags: ["ListTagResources", "RDS"],
+  replacePgTags: ["TagResources", "RDS"],
   describePg: ["DescribeDBInstanceAttribute", "RDS"],
   deletePg: ["DeleteDBInstance", "RDS"],
   getCapacity: ["DescribeDBInstanceCapacity", "RdsAi"],
@@ -1162,6 +1451,7 @@ const MOCK_ACTION_MAP: Record<string, [string, string]> = {
   startSupabase: ["StartInstance", "RdsAi"],
   stopSupabase: ["StopInstance", "RdsAi"],
   restartSupabase: ["RestartInstance", "RdsAi"],
+  resetStudioPassword: ["ResetInstancePassword", "RdsAi"],
   deleteSupabase: ["DeleteAppInstance", "RdsAi"],
   supabaseEndpoints: ["DescribeInstanceEndpoints", "RdsAi"],
   supabaseWhitelist: ["DescribeInstanceIpWhitelist", "RdsAi"],
@@ -1381,6 +1671,7 @@ const BASE_SCHEMA_STATEMENTS = [
       weight integer not null default 1,
       reserved_slots integer not null default 0,
       capacity json not null default '{}'::json,
+      tags json not null default '[]'::json,
       added_at timestamp not null default now(),
       updated_at timestamp not null default now(),
       last_checked_at timestamp
@@ -1398,6 +1689,7 @@ const BASE_SCHEMA_STATEMENTS = [
       vpc_id varchar(80),
       vswitch_id varchar(80),
       pg_instance_id varchar(80),
+      pg_tags json not null default '[]'::json,
       supabase_instance_id varchar(80),
       instance_class varchar(80) not null default '',
       cloud_status varchar(40),
@@ -1496,6 +1788,15 @@ const BASE_SCHEMA_STATEMENTS = [
       value json not null default '{}'::json,
       updated_at timestamp not null default now()
     )`,
+    `create table if not exists instance_credentials (
+      instance_id varchar(40) primary key,
+      studio_username varchar(80) not null default 'supabase',
+      studio_password_enc text not null,
+      initialized boolean not null default false,
+      key_version integer not null default 1,
+      updated_at timestamp not null default now(),
+      updated_by varchar(160) not null default ''
+    )`,
 ];
 
 let baseSchemaReady = false;
@@ -1509,6 +1810,23 @@ async function normalizeInstanceDetailEncoding() {
     where jsonb_typeof(detail::jsonb) = 'string'
       and left(btrim(detail #>> '{}'), 1) = '{'
   `);
+}
+
+async function ensurePgTagColumns() {
+  await sql`alter table pool_instances add column if not exists pg_tags json not null default '[]'::json`;
+  await sql`alter table shared_pgs add column if not exists tags json not null default '[]'::json`;
+}
+
+async function ensureInstanceCredentialsTable() {
+  await sql`create table if not exists instance_credentials (
+    instance_id varchar(40) primary key,
+    studio_username varchar(80) not null default 'supabase',
+    studio_password_enc text not null,
+    initialized boolean not null default false,
+    key_version integer not null default 1,
+    updated_at timestamp not null default now(),
+    updated_by varchar(160) not null default ''
+  )`;
 }
 
 async function ensureBaseSchema() {
@@ -1529,6 +1847,8 @@ async function ensureBaseSchema() {
   const present = existing[0] || {};
   if (BASE_TABLE_NAMES.every((name) => !!present[name])) {
     await normalizeInstanceDetailEncoding();
+    await ensurePgTagColumns();
+    await ensureInstanceCredentialsTable();
     baseSchemaReady = true;
     return;
   }
@@ -1536,6 +1856,8 @@ async function ensureBaseSchema() {
     await sql.unsafe(statement);
   }
   await normalizeInstanceDetailEncoding();
+  await ensurePgTagColumns();
+  await ensureInstanceCredentialsTable();
   baseSchemaReady = true;
 }
 
@@ -2314,7 +2636,7 @@ async function updateTask(task: any, fields: Record<string, any>) {
 
 async function setInstance(id: string, fields: Record<string, any>) {
   const allowed = new Set([
-    "status", "supabase_instance_id", "pg_instance_id", "vswitch_id",
+    "status", "supabase_instance_id", "pg_instance_id", "pg_tags", "vswitch_id",
     "cloud_status", "detail", "error", "is_deleted", "deleted_at",
     "owner_user_id", "bound_user", "bound_app_id",
   ]);
@@ -2393,9 +2715,11 @@ async function processPrewarm(task: any, inst: any) {
   const pool = poolRows[0] || {};
   const config = parseObject(pool.config);
   if (step === "prepare") {
-    if (!inst.pg_instance_id) {
+    let pgId = inst.pg_instance_id;
+    if (!pgId) {
       if (inst.mode === "single") {
-        const pgId = await adapter.createPg({
+        const pgTags = normalizePgTags(config.single_pg_tags);
+        pgId = await adapter.createPg({
           instance_class: config.single_pg_class,
           engine_version: config.single_engine_version,
           storage_gb: config.single_pg_storage,
@@ -2406,8 +2730,9 @@ async function processPrewarm(task: any, inst: any) {
           security_ip_list: config.single_pg_security_ips,
           description: `pool-single-${inst.id.slice(0, 8)}`,
           client_token: inst.id,
+          tags: pgTags,
         });
-        await setInstance(inst.id, { pg_instance_id: pgId });
+        await setInstance(inst.id, { pg_instance_id: pgId, pg_tags: pgTags });
       } else {
         const shared = await sql`
           select * from shared_pgs
@@ -2415,7 +2740,15 @@ async function processPrewarm(task: any, inst: any) {
           order by added_at asc limit 1
         `;
         if (!shared[0]) throw new Error("共享池没有可用的共享 PG");
-        await setInstance(inst.id, { pg_instance_id: shared[0].pg_instance_id, vswitch_id: shared[0].vswitch_id });
+        pgId = shared[0].pg_instance_id;
+        await setInstance(inst.id, { pg_instance_id: pgId, vswitch_id: shared[0].vswitch_id });
+      }
+    }
+    if (inst.mode === "single" && pgId) {
+      const pgTags = normalizePgTags(config.single_pg_tags);
+      if (pgTags.length) {
+        const observed = await adapter.replacePgTags(pgId, pgTags);
+        await setInstance(inst.id, { pg_tags: observed });
       }
     }
     return scheduleTask(task, "wait_pg", 20, "等待 PG 就绪", 3);
@@ -2430,6 +2763,12 @@ async function processPrewarm(task: any, inst: any) {
   if (step === "create_supabase") {
     let supabaseId = inst.supabase_instance_id;
     if (!supabaseId) {
+      let credential = await readStudioCredential(inst.id);
+      if (!credential || !credential.initialized) {
+        const password = credential?.password || randomStudioPassword();
+        await saveStudioCredential(inst.id, password, true, "prewarm");
+        credential = { instance_id: inst.id, username: STUDIO_USERNAME, password, initialized: true };
+      }
       const vswitch = inst.mode === "shared" ? inst.vswitch_id : pool.vswitch_id;
       supabaseId = await adapter.createSupabase({
         mode: inst.mode,
@@ -2437,8 +2776,8 @@ async function processPrewarm(task: any, inst: any) {
         vswitch_id: vswitch,
         app_name: `pool-${inst.id.slice(0, 8)}`,
         instance_class: inst.mode === "shared" ? "rdsai.supabase.share.basic" : "rdsai.supabase.basic",
-        dashboard_username: "supabase",
-        dashboard_password: Deno.env.get("SUPABASE_DASHBOARD_PASSWORD") || randomToken(18),
+        dashboard_username: STUDIO_USERNAME,
+        dashboard_password: credential.password,
         database_password: Deno.env.get("SUPABASE_DATABASE_PASSWORD") || randomToken(18),
         public_endpoint_enabled: config.public_endpoint_enabled !== false,
       });
@@ -2599,6 +2938,7 @@ async function processSharedPgCreate(task: any) {
   const config = poolConfig(pool.config);
   const result = parseObject(task.result);
   let pgId = String(result.pg_instance_id || "");
+  const pgTags = normalizePgTags(payload.tags);
 
   if (task.step === "create_pg") {
     if (!pgId) {
@@ -2613,23 +2953,42 @@ async function processSharedPgCreate(task: any) {
         security_ip_list: config.single_pg_security_ips,
         description: String(payload.name || `pool-shared-${pool.id.slice(0, 8)}`).slice(0, 64),
         client_token: task.id,
+        tags: pgTags,
       });
     }
     await sql`
       insert into shared_pgs (pg_instance_id, pool_id, name, region_id, status, instance_class, engine_version, storage_gb,
-                              vpc_id, vswitch_id, zone_id, enabled, weight, reserved_slots, capacity, added_at, updated_at, last_checked_at)
+                              vpc_id, vswitch_id, zone_id, enabled, weight, reserved_slots, capacity, tags, added_at, updated_at, last_checked_at)
       values (${pgId}, ${pool.id}, ${payload.name || pgId}, ${pool.region_id}, 'Creating',
               ${payload.instance_class || config.shared_pg_class}, ${payload.engine_version || config.shared_pg_engine_version},
               ${Number(payload.storage_gb || config.shared_pg_storage)}, ${pool.vpc_id}, ${pool.vswitch_id},
-              ${payload.zone_id || pool.zone_id}, true, 1, 0, '{}'::json, now(), now(), now())
+              ${payload.zone_id || pool.zone_id}, true, 1, 0, '{}'::json, ${pgTags}::json, now(), now(), now())
       on conflict (pg_instance_id) do update set
         pool_id = excluded.pool_id, name = excluded.name, region_id = excluded.region_id,
         status = 'Creating', vpc_id = excluded.vpc_id, vswitch_id = excluded.vswitch_id,
-        zone_id = excluded.zone_id, enabled = true, updated_at = now()
+        zone_id = excluded.zone_id, enabled = true, tags = excluded.tags, updated_at = now()
     `;
     await updateTask(task, {
-      step: "wait_pg",
+      step: pgTags.length ? "tag_pg" : "wait_pg",
       progress: 30,
+      message: pgTags.length ? "同步共享 PG 标签" : "等待共享 PG Running",
+      result: JSON.stringify({ ...result, pg_instance_id: pgId }),
+      locked_at: null,
+    });
+    await sql`update tasks set next_run_at = now() + interval '2 seconds' where id = ${task.id}`;
+    return;
+  }
+
+  if (task.step === "tag_pg") {
+    if (!pgId) {
+      await failTask(task, "共享 PG 缺少实例 ID");
+      return;
+    }
+    const observed = await adapter.replacePgTags(pgId, pgTags);
+    await sql`update shared_pgs set tags = ${observed}::json, updated_at = now() where pg_instance_id = ${pgId}`;
+    await updateTask(task, {
+      step: "wait_pg",
+      progress: 40,
       message: "等待共享 PG Running",
       result: JSON.stringify({ ...result, pg_instance_id: pgId }),
       locked_at: null,
@@ -2749,6 +3108,19 @@ async function processAllocate(task: any, inst: any) {
   }
 }
 
+async function releaseContinue(
+  task: any,
+  inst: any,
+  config: Record<string, any>,
+  progress: number,
+  message = "停止实例",
+) {
+  if (config.allow_user_studio !== false && !(await studioCredentialInitialized(inst.id))) {
+    return scheduleTask(task, "studio_credentials", progress, "初始化 Studio 凭据", 1);
+  }
+  return scheduleTask(task, "stop_supabase", progress, message, 1);
+}
+
 async function processRelease(task: any, inst: any) {
   const payload = parseObject(task.payload);
   const adapter = cloudAdapter(payload.cloud_mode || CLOUD_MODE, inst.region_id);
@@ -2763,6 +3135,7 @@ async function processRelease(task: any, inst: any) {
     }
     if (step === "delete_pg") {
       if (inst.mode === "single" && inst.pg_instance_id) await adapter.deletePg(inst.pg_instance_id);
+      await sql`delete from instance_credentials where instance_id = ${inst.id}`;
       await setInstance(inst.id, { status: "Deleted", is_deleted: true, deleted_at: new Date(), error: null });
       await finishTask(task, { instance_id: inst.id, status: "Deleted" });
     }
@@ -2799,7 +3172,7 @@ async function processRelease(task: any, inst: any) {
     if (releasePoolConfig.agent_runtime_enabled !== false && !runtimeEnabled) {
       return scheduleTask(task, "enable_agent_runtime", 50, "归还时启用 Agent Runtime", 1);
     }
-    return scheduleTask(task, "stop_supabase", 50, "停止实例", 1);
+    return await releaseContinue(task, inst, releasePoolConfig, 55);
   }
   if (step === "enable_agent_runtime") {
     const data = await adapter.describeSupabase(inst.supabase_instance_id);
@@ -2808,7 +3181,7 @@ async function processRelease(task: any, inst: any) {
         ...detail,
         agent_runtime: { enabled: true, state: "enabled", last_error: "", updated_by: "release" },
       });
-      return scheduleTask(task, "stop_supabase", 55, "停止实例", 1);
+      return await releaseContinue(task, inst, releasePoolConfig, 58);
     }
     try {
       await adapter.enableAgentRuntime(inst.supabase_instance_id, inst.vswitch_id || "");
@@ -2826,7 +3199,7 @@ async function processRelease(task: any, inst: any) {
       await writeAuditEvent(inst.id, "agent_runtime_enable_failed", "归还时启用 Agent Runtime 失败", {
         error: String(err),
       });
-      return scheduleTask(task, "stop_supabase", 55, "启用失败，继续停止实例", 1);
+      return await releaseContinue(task, inst, releasePoolConfig, 58, "启用失败，继续停止实例");
     }
   }
   if (step === "wait_agent_runtime") {
@@ -2837,7 +3210,7 @@ async function processRelease(task: any, inst: any) {
         cloud: data,
         agent_runtime: { enabled: true, state: "enabled", last_error: "", updated_by: "release" },
       });
-      return scheduleTask(task, "stop_supabase", 58, "停止实例", 1);
+      return await releaseContinue(task, inst, releasePoolConfig, 62);
     }
     const result = parseObject(task.result);
     const attempts = Number(result.release_runtime_wait_attempts || 0) + 1;
@@ -2852,12 +3225,76 @@ async function processRelease(task: any, inst: any) {
         },
       });
       await writeAuditEvent(inst.id, "agent_runtime_enable_timeout", "归还时等待 Agent Runtime 超时", {});
-      return scheduleTask(task, "stop_supabase", 58, "等待超时，继续停止实例", 1);
+      return await releaseContinue(task, inst, releasePoolConfig, 62, "等待超时，继续停止实例");
     }
     await updateTask(task, {
       result: JSON.stringify({ ...result, release_runtime_wait_attempts: attempts }),
     });
     return scheduleTask(task, "wait_agent_runtime", 55, `等待 Agent Runtime 就绪（${data.status}）`, 10);
+  }
+  if (step === "studio_credentials") {
+    if (await studioCredentialInitialized(inst.id)) {
+      return await releaseContinue(task, inst, releasePoolConfig, 65);
+    }
+    try {
+      await rotateStudioCredential(inst, adapter, "release");
+      return scheduleTask(task, "wait_studio_credentials", 68, "等待 Studio 密码生效", 8);
+    } catch (err) {
+      const message = `归还时初始化 Studio 凭据失败：${String(err)}`;
+      await saveInstanceDetail(inst, {
+        ...parseObject(inst.detail),
+        studio_rotation_pending: true,
+        studio_error: String(err),
+      }, { error: message });
+      let stopped = false;
+      try {
+        await adapter.stopSupabase(inst.supabase_instance_id, false);
+        stopped = true;
+      } catch {
+        // keep the failure visible
+      }
+      await failTask(task, message, true);
+      if (stopped) await setInstance(inst.id, { status: "InCold", cloud_status: "Stopped" });
+      return;
+    }
+  }
+  if (step === "wait_studio_credentials") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status === "Stopped") {
+      await adapter.startSupabase(inst.supabase_instance_id);
+      return scheduleTask(task, "wait_studio_credentials", 68, "等待实例重新启动", 8);
+    }
+    if (data.status === "Running") {
+      await saveInstanceDetail(inst, {
+        ...parseObject(inst.detail),
+        cloud: data,
+        studio_rotation_pending: false,
+        studio_error: "",
+      }, { error: null });
+      return scheduleTask(task, "stop_supabase", 72, "停止实例", 1);
+    }
+    const result = parseObject(task.result);
+    const attempts = Number(result.release_studio_wait_attempts || 0) + 1;
+    if (attempts >= 90) {
+      const message = "等待 Studio 密码生效超时";
+      await saveInstanceDetail(inst, {
+        ...parseObject(inst.detail),
+        studio_rotation_pending: true,
+        studio_error: message,
+      }, { error: message });
+      let stopped = false;
+      try {
+        await adapter.stopSupabase(inst.supabase_instance_id, false);
+        stopped = true;
+      } catch {
+        // keep the failure visible
+      }
+      await failTask(task, message, true);
+      if (stopped) await setInstance(inst.id, { status: "InCold", cloud_status: "Stopped" });
+      return;
+    }
+    await updateTask(task, { result: JSON.stringify({ ...result, release_studio_wait_attempts: attempts }) });
+    return scheduleTask(task, "wait_studio_credentials", 70, `等待 Studio 密码生效（${data.status}）`, 8);
   }
   if (step === "stop_supabase") {
     if (inst.supabase_instance_id) {
@@ -3016,14 +3453,141 @@ async function processAgentRuntimeBackfill(task: any, inst: any) {
   await failTask(task, `未知步骤：${step}`, true);
 }
 
+async function processStudioCredentialBackfill(task: any, inst: any) {
+  const payload = parseObject(task.payload);
+  const adapter = cloudAdapter(payload.cloud_mode || CLOUD_MODE, inst.region_id);
+  const step = task.step || "start";
+  const detail = parseObject(inst.detail);
+  if (!inst.supabase_instance_id) {
+    await failTask(task, "实例尚未创建 Supabase 资源", true);
+    return;
+  }
+  if (step === "start") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status === "Stopped") {
+      await adapter.startSupabase(inst.supabase_instance_id);
+      return scheduleTask(task, "wait_running", 20, "等待实例 Running", 8);
+    }
+    if (data.status === "Running") {
+      return scheduleTask(task, "rotate", 35, "重置 Studio 密码", 1);
+    }
+    return scheduleTask(task, "start", 15, `等待实例可启动（${data.status}）`, 8);
+  }
+  if (step === "wait_running") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status === "Running") return scheduleTask(task, "rotate", 35, "重置 Studio 密码", 1);
+    return scheduleTask(task, "wait_running", 25, `等待实例 Running（${data.status}）`, 8);
+  }
+  if (step === "rotate") {
+    try {
+      await rotateStudioCredential(inst, adapter, "admin_studio_backfill");
+      return scheduleTask(task, "wait_reset", 55, "等待 Studio 密码生效", 8);
+    } catch (err) {
+      const message = `重置 Studio 密码失败：${String(err)}`;
+      await saveInstanceDetail(inst, {
+        ...detail,
+        studio_rotation_pending: true,
+        studio_error: String(err),
+      }, { error: message });
+      let stopped = false;
+      try {
+        await adapter.stopSupabase(inst.supabase_instance_id, false);
+        stopped = true;
+      } catch {
+        // keep the failure visible
+      }
+      await failTask(task, message, true);
+      if (stopped) await setInstance(inst.id, { status: "InCold", cloud_status: "Stopped" });
+      return;
+    }
+  }
+  if (step === "wait_reset") {
+    const data = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (data.status === "Stopped") {
+      await adapter.startSupabase(inst.supabase_instance_id);
+      return scheduleTask(task, "wait_reset", 60, "等待实例重新启动", 8);
+    }
+    if (data.status !== "Running") {
+      const result = parseObject(task.result);
+      const attempts = Number(result.studio_backfill_wait_attempts || 0) + 1;
+      if (attempts >= 90) {
+        const message = "等待实例重启完成超时";
+        await saveInstanceDetail(inst, {
+          ...detail,
+          studio_rotation_pending: true,
+          studio_error: message,
+        }, { error: message });
+        let stopped = false;
+        try {
+          await adapter.stopSupabase(inst.supabase_instance_id, false);
+          stopped = true;
+        } catch {
+          // keep the failure visible
+        }
+        await failTask(task, message, true);
+        if (stopped) await setInstance(inst.id, { status: "InCold", cloud_status: "Stopped" });
+        return;
+      }
+      await updateTask(task, { result: JSON.stringify({ ...result, studio_backfill_wait_attempts: attempts }) });
+      return scheduleTask(task, "wait_reset", 60, `等待实例重启完成（${data.status}）`, 8);
+    }
+    try {
+      await applyClosedNetwork(inst, adapter, "admin_studio_backfill");
+      return scheduleTask(task, "stop", 75, "停止实例", 1);
+    } catch (err) {
+      const message = `关闭白名单失败：${String(err)}`;
+      await saveInstanceDetail(inst, {
+        ...detail,
+        studio_error: String(err),
+      }, { error: message });
+      let stopped = false;
+      try {
+        await adapter.stopSupabase(inst.supabase_instance_id, false);
+        stopped = true;
+      } catch {
+        // keep the failure visible
+      }
+      await failTask(task, message, true);
+      if (stopped) await setInstance(inst.id, { status: "InCold", cloud_status: "Stopped" });
+      return;
+    }
+  }
+  if (step === "stop") {
+    const current = await adapter.describeSupabase(inst.supabase_instance_id);
+    if (current.status === "Stopped") return scheduleTask(task, "wait_stopped", 90, "等待实例停止", 2);
+    if (current.status !== "Running") {
+      return scheduleTask(task, "stop", 80, `等待实例稳定后停止（${current.status}）`, 8);
+    }
+    await adapter.stopSupabase(inst.supabase_instance_id, false);
+    return scheduleTask(task, "wait_stopped", 90, "等待实例停止", 5);
+  }
+  if (step === "wait_stopped") {
+    if (adapter.mode === "real") {
+      const data = await adapter.describeSupabase(inst.supabase_instance_id);
+      if (data.status !== "Stopped") return scheduleTask(task, "wait_stopped", 92, `等待实例停止（${data.status}）`, 8);
+    }
+    await saveInstanceDetail(inst, {
+      ...parseObject(inst.detail),
+      studio_rotation_pending: false,
+      studio_error: "",
+    }, { status: "InCold", cloud_status: "Stopped", error: null });
+    await finishTask(task, { instance_id: inst.id, status: "InCold" });
+    return;
+  }
+  await failTask(task, `未知步骤：${step}`, true);
+}
+
 const DEFAULT_POOL_CONFIG = {
   target: 2, max: 4, batch_size: 1, batch_interval_sec: 6, poll_interval_sec: 8, create_timeout_sec: 900,
   auto_refill: false, refill_interval_sec: 30, release_policy: "return", stop_mode: "normal",
   single_pg_class: "pg.n2.2c.1m", single_pg_storage: 20, single_pg_category: "Basic",
   single_engine_version: "17.0", single_pg_security_ips: "127.0.0.1", public_endpoint_enabled: true,
+  single_pg_tags: [] as PgTag[],
   shared_pg_class: "pg.n2.2c.2m", shared_pg_storage: 20, shared_pg_category: "HighAvailability",
   shared_pg_engine_version: "18.0", network_policy: DEFAULT_NETWORK_POLICY,
   agent_runtime_enabled: true,
+  allow_user_studio: true,
+  allow_user_agent_runtime: true,
 };
 
 function poolConfig(value: unknown): Record<string, any> {
@@ -3057,6 +3621,7 @@ function sharedPgView(row: any) {
     reserved_slots: Number(row.reserved_slots || 0),
     tenant_count: Number(row.tenant_count || 0),
     capacity: parseObject(row.capacity),
+    tags: safePgTags(row.tags),
     last_checked_at: row.last_checked_at,
     added_at: row.added_at,
   };
@@ -3688,6 +4253,7 @@ async function workerTick() {
     else if (task.kind === "allocate") await processAllocate(task, inst);
     else if (task.kind === "release") await processRelease(task, inst);
     else if (task.kind === "agent_runtime") await processAgentRuntimeBackfill(task, inst);
+    else if (task.kind === "studio_credentials") await processStudioCredentialBackfill(task, inst);
     else if (["start", "stop", "restart", "sync"].includes(task.kind)) await processAction(task, inst);
     else {
       await finishTask(task, { skipped: true });
@@ -3895,6 +4461,7 @@ async function handler(req: Request): Promise<Response> {
           { value: "selfheal", label: "自愈巡检" },
           { value: "shared_pg_create", label: "创建共享 PG" },
           { value: "agent_runtime", label: "启用 Agent Runtime" },
+          { value: "studio_credentials", label: "初始化 Studio 凭据" },
         ],
         cpu_options: [2, 4, 8],
       });
@@ -4287,6 +4854,48 @@ async function handler(req: Request): Promise<Response> {
       return json({ task_ids: taskIds, count: taskIds.length });
     }
 
+    if (path === "/api/instances/backfill-studio-credentials" && method === "POST") {
+      if (!(await requireAdmin(req))) return error("需要管理员权限", 403);
+      const body = await req.json();
+      const conditions = [
+        "is_deleted = false",
+        "status = 'InCold'",
+        "supabase_instance_id is not null",
+        "not exists (select 1 from instance_credentials c where c.instance_id = pool_instances.id and c.initialized = true)",
+        "not exists (select 1 from tasks t where t.target_id = pool_instances.id and t.kind = 'studio_credentials' and t.status in ('pending', 'running'))",
+        "not exists (select 1 from pools p where p.id = pool_instances.pool_id and coalesce((p.config #>> '{}')::json->>'allow_user_studio', 'true') = 'false')",
+      ];
+      const params: any[] = [];
+      if (body.pool_id) {
+        params.push(String(body.pool_id));
+        conditions.push(`pool_id = $${params.length}`);
+      }
+      if (body.region_id) {
+        params.push(String(body.region_id));
+        conditions.push(`region_id = $${params.length}`);
+      }
+      const limit = Math.max(1, Math.min(5, Number(body.limit || 5)));
+      params.push(limit);
+      const rows = await sql.unsafe(
+        `select * from pool_instances where ${conditions.join(" and ")} order by created_at asc limit $${params.length}`,
+        params,
+      );
+      const taskIds: string[] = [];
+      for (const inst of rows) {
+        const taskId = randomId();
+        const cloudMode = parseObject(inst.detail).cloud_mode || CLOUD_MODE;
+        await sql`
+          insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
+          values (${taskId}, 'studio_credentials', ${inst.mode}, ${inst.pool_id}, ${inst.id}, ${`初始化 Studio 凭据 ${inst.app_name}`}, 'pending', 0, '等待 worker',
+                  ${JSON.stringify({ instance_id: inst.id, cloud_mode: cloudMode, source: "admin_backfill" })}::json, '{}'::json, 'start', 0, now())
+        `;
+        await setInstance(inst.id, { status: "Creating", error: null });
+        await writeAuditEvent(inst.id, "studio_credentials_backfill", "管理员初始化 Studio 凭据", { task_id: taskId });
+        taskIds.push(taskId);
+      }
+      return json({ task_ids: taskIds, count: taskIds.length });
+    }
+
     if ((path === "/api/v1/portal/instances/apply" || path === "/api/portal/instances/apply") && method === "POST") {
       const ctx = await authenticate(req);
       if (!hasScope(ctx, "instances:apply")) return error("API Token 缺少 instances:apply 权限", 403);
@@ -4303,7 +4912,9 @@ async function handler(req: Request): Promise<Response> {
       const poolRows = await sql`select * from pools where region_id = ${regionId} and mode = ${mode} and enabled = true limit 1`;
       const pool: any = poolRows[0];
       if (!pool) return error("资源池不存在");
-      const policy = networkPolicy(poolConfig(pool.config));
+      const poolSettings = poolConfig(pool.config);
+      const policy = networkPolicy(poolSettings);
+      const studioRequired = poolSettings.allow_user_studio !== false;
       if (!policy.allow_user_edit && body.network !== undefined) {
         return error("管理员未开放使用者配置网络白名单");
       }
@@ -4321,15 +4932,37 @@ async function handler(req: Request): Promise<Response> {
         limit 1
       `;
       if (active[0]) return error("该应用已有运行中的实例，请先归还", 409);
-      const candidates = await sql`
-        select * from pool_instances
-        where pool_id = ${pool.id} and is_deleted = false and status = 'InCold'
-          and coalesce(detail->>'reserved', 'false') != 'true'
-          and owner_user_id is null
-        order by created_at asc limit 1
-      `;
+      const candidates = studioRequired
+        ? await sql`
+          select * from pool_instances
+          where pool_id = ${pool.id} and is_deleted = false and status = 'InCold'
+            and coalesce(detail->>'reserved', 'false') != 'true'
+            and coalesce(detail->>'studio_rotation_pending', 'false') != 'true'
+            and owner_user_id is null
+            and exists (
+              select 1 from instance_credentials c
+              where c.instance_id = pool_instances.id and c.initialized = true
+            )
+          order by created_at asc limit 1
+        `
+        : await sql`
+          select * from pool_instances
+          where pool_id = ${pool.id} and is_deleted = false and status = 'InCold'
+            and coalesce(detail->>'reserved', 'false') != 'true'
+            and owner_user_id is null
+          order by created_at asc limit 1
+        `;
       const instance: any = candidates[0];
-      if (!instance) return error("该地域冷池暂无可用实例，请联系管理员预热", 409);
+      if (!instance) {
+        return error(
+          studioRequired
+            ? "该地域冷池暂无已初始化 Studio 凭据的可用实例，请联系管理员初始化 Studio 凭据"
+            : "该地域冷池暂无可用实例，请联系管理员预热",
+          409,
+        );
+      }
+      const studioGuard = await studioAllocationGuard(instance, pool);
+      if (studioGuard) return error(studioGuard, 409);
       const initialNetwork = {
         managed: true,
         mode: selection.mode,
@@ -4457,6 +5090,11 @@ async function handler(req: Request): Promise<Response> {
       if (!pool) return error("资源池不存在", 404);
       const nextConfig = poolConfig(body.config !== undefined ? body.config : pool.config);
       nextConfig.network_policy = networkPolicy(nextConfig);
+      try {
+        nextConfig.single_pg_tags = normalizePgTags(nextConfig.single_pg_tags);
+      } catch (err) {
+        return error(`单租 PG 标签无效：${String(err)}`, 400);
+      }
       if (Number(nextConfig.target) > Number(nextConfig.max)) return error("目标水位不能大于最大实例数");
       await sql`
         update pools set
@@ -4493,6 +5131,12 @@ async function handler(req: Request): Promise<Response> {
       if (!pool.vpc_id || !pool.vswitch_id) return error("共享池未配置 VPC / VSwitch");
       const config = poolConfig(pool.config);
       const name = String(body.name || "").trim() || `共享 PG ${randomToken(4)}`;
+      let tags: PgTag[];
+      try {
+        tags = normalizePgTags(body.tags);
+      } catch (err) {
+        return error(`共享 PG 标签无效：${String(err)}`, 400);
+      }
       const taskId = randomId();
       await sql`
         insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
@@ -4505,6 +5149,7 @@ async function handler(req: Request): Promise<Response> {
                   engine_version: String(body.engine_version || config.shared_pg_engine_version),
                   storage_gb: Number(body.storage_gb || config.shared_pg_storage),
                   zone_id: String(body.zone_id || pool.zone_id || ""),
+                  tags,
                 })}::json, '{}'::json, 'create_pg', 0, now())
       `;
       return json({ task_id: taskId, pool_id: pool.id, name });
@@ -4528,16 +5173,24 @@ async function handler(req: Request): Promise<Response> {
       } catch {
         capacity = {};
       }
+      let tags: PgTag[] = [];
+      try {
+        tags = body.tags !== undefined
+          ? await adapter.replacePgTags(pgId, normalizePgTags(body.tags))
+          : await adapter.pgTags(pgId);
+      } catch (err) {
+        return error(`同步 PG 标签失败：${String(err)}`, 502);
+      }
       await sql`
         insert into shared_pgs (pg_instance_id, pool_id, name, region_id, status, instance_class, engine_version, storage_gb,
-                                vpc_id, vswitch_id, zone_id, enabled, weight, reserved_slots, capacity, added_at, updated_at, last_checked_at)
+                                vpc_id, vswitch_id, zone_id, enabled, weight, reserved_slots, capacity, tags, added_at, updated_at, last_checked_at)
         values (${pgId}, ${poolId}, ${body.name || pgId}, ${pool.region_id}, ${pg.status}, '', '', null,
                 ${pg.vpc_id || null}, ${pg.vswitch_id || null}, ${pg.zone_id || null}, true, 1, 0,
-                ${JSON.stringify(capacity)}::json, now(), now(), now())
+                ${JSON.stringify(capacity)}::json, ${tags}::json, now(), now(), now())
         on conflict (pg_instance_id) do update set pool_id = excluded.pool_id, name = excluded.name,
           region_id = excluded.region_id, status = excluded.status, vpc_id = excluded.vpc_id,
           vswitch_id = excluded.vswitch_id, zone_id = excluded.zone_id, capacity = excluded.capacity,
-          enabled = true, updated_at = now(), last_checked_at = now()
+          tags = excluded.tags, enabled = true, updated_at = now(), last_checked_at = now()
       `;
       return json((await sharedPgRows(poolId)).find((item: any) => item.pg_instance_id === pgId));
     }
@@ -4563,11 +5216,23 @@ async function handler(req: Request): Promise<Response> {
       const rows = await sql`select * from shared_pgs where pg_instance_id = ${pgId} limit 1`;
       const row: any = rows[0];
       if (!row) return error("共享 PG 不存在", 404);
+      let tags: PgTag[] | null = null;
+      if (body.tags !== undefined) {
+        const adapter = cloudAdapter(CLOUD_MODE, row.region_id);
+        try {
+          tags = await adapter.replacePgTags(pgId, normalizePgTags(body.tags));
+        } catch (err) {
+          return error(`同步 PG 标签失败：${String(err)}`, 502);
+        }
+      }
       await sql`
         update shared_pgs set name = ${body.name ?? row.name}, enabled = ${body.enabled !== undefined ? !!body.enabled : row.enabled},
           weight = ${body.weight ?? row.weight}, updated_at = now()
         where pg_instance_id = ${pgId}
       `;
+      if (tags !== null) {
+        await sql`update shared_pgs set tags = ${tags}::json, updated_at = now() where pg_instance_id = ${pgId}`;
+      }
       return json((await sharedPgRows(row.pool_id)).find((item: any) => item.pg_instance_id === pgId));
     }
 
@@ -4585,10 +5250,17 @@ async function handler(req: Request): Promise<Response> {
       } catch {
         capacity = row.capacity || {};
       }
+      let tags = safePgTags(row.tags);
+      try {
+        tags = await adapter.pgTags(pgId);
+      } catch {
+        // keep the last known tags when the cloud read fails
+      }
       await sql`
         update shared_pgs set status = ${pg.status}, vpc_id = ${pg.vpc_id || row.vpc_id},
           vswitch_id = ${pg.vswitch_id || row.vswitch_id}, zone_id = ${pg.zone_id || row.zone_id},
-          capacity = ${JSON.stringify(capacity)}::json, last_checked_at = now(), updated_at = now()
+          capacity = ${JSON.stringify(capacity)}::json, tags = ${tags}::json,
+          last_checked_at = now(), updated_at = now()
         where pg_instance_id = ${pgId}
       `;
       return json((await sharedPgRows(row.pool_id)).find((item: any) => item.pg_instance_id === pgId));
@@ -5036,7 +5708,14 @@ async function handler(req: Request): Promise<Response> {
         `select * from pool_instances where ${conditions.join(" and ")} order by created_at desc limit $${params.length}`,
         params,
       );
-      return json({ instances: rows });
+      const credentials = await sql`select instance_id, initialized from instance_credentials`;
+      const readyById = new Map(credentials.map((row: any) => [row.instance_id, !!row.initialized]));
+      return json({
+        instances: rows.map((row: any) => ({
+          ...row,
+          studio_credentials_ready: readyById.get(row.id) === true,
+        })),
+      });
     }
 
     if (path === "/api/tasks" && method === "GET") {
@@ -5140,7 +5819,13 @@ async function handler(req: Request): Promise<Response> {
       if (!(await requireAdmin(req))) return error("需要管理员权限", 403);
       const id = path.split("/").pop();
       const rows = await sql`select * from pool_instances where id = ${id} limit 1`;
-      return rows[0] ? json({ ...rows[0], detail: parseObject(rows[0].detail) }) : error("实例不存在", 404);
+      if (!rows[0]) return error("实例不存在", 404);
+      const credentials = await sql`select initialized from instance_credentials where instance_id = ${id} limit 1`;
+      return json({
+        ...rows[0],
+        detail: parseObject(rows[0].detail),
+        studio_credentials_ready: !!credentials[0]?.initialized,
+      });
     }
 
     if (/^\/api\/instances\/[^/]+\/events$/.test(path) && method === "GET") {
@@ -5167,6 +5852,73 @@ async function handler(req: Request): Promise<Response> {
       `;
       await writeAuditEvent(inst.id, action, `手动${action}`, { previous_status: inst.status, force: !!body.force });
       return json({ task_id: taskId, action });
+    }
+
+    if (/^\/api\/instances\/[^/]+\/pg-tags$/.test(path) && (method === "GET" || method === "PATCH")) {
+      if (!(await requireAdmin(req))) return error("需要管理员权限", 403);
+      const id = path.split("/").slice(-2)[0];
+      const rows = await sql`select * from pool_instances where id = ${id} and is_deleted = false limit 1`;
+      const inst: any = rows[0];
+      if (!inst) return error("实例不存在", 404);
+      if (inst.mode !== "single") return error("共享 PG 标签请在共享 PG 列表维护", 400);
+      if (!inst.pg_instance_id) return error("实例尚未创建 PG", 404);
+      const detail = parseObject(inst.detail);
+      const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
+      try {
+        const tags = method === "PATCH"
+          ? await adapter.replacePgTags(inst.pg_instance_id, normalizePgTags((await req.json()).tags))
+          : await adapter.pgTags(inst.pg_instance_id);
+        await setInstance(inst.id, { pg_tags: tags });
+        if (method === "PATCH") {
+          await writeAuditEvent(inst.id, "pg_tags_update", "更新 PG 标签", { tags });
+        }
+        return json({ pg_instance_id: inst.pg_instance_id, tags });
+      } catch (err) {
+        return error(`PG 标签操作失败：${String(err)}`, 502);
+      }
+    }
+
+    if (/^\/api\/instances\/[^/]+\/access$/.test(path) && method === "GET") {
+      if (!(await requireAdmin(req))) return error("需要管理员权限", 403);
+      const id = path.split("/").slice(-2)[0];
+      const rows = await sql`select * from pool_instances where id = ${id} and is_deleted = false limit 1`;
+      const inst: any = rows[0];
+      if (!inst) return error("实例不存在", 404);
+      const poolRows = inst.pool_id ? await sql`select config from pools where id = ${inst.pool_id} limit 1` : [];
+      const config = poolConfig(poolRows[0]?.config);
+      const detail = parseObject(inst.detail);
+      const network = networkView(detail);
+      const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
+      const access = await studioAccessPayload(adapter, inst, config);
+      return json({ ...access, network_state: network.state });
+    }
+
+    if (/^\/api\/instances\/[^/]+\/access\/studio-password\/reveal$/.test(path) && method === "POST") {
+      const ctx = await requireAdmin(req);
+      if (!ctx) return error("需要管理员权限", 403);
+      const id = path.split("/").slice(-4)[0];
+      const rows = await sql`select * from pool_instances where id = ${id} and is_deleted = false limit 1`;
+      const inst: any = rows[0];
+      if (!inst) return error("实例不存在", 404);
+      if (inst.status !== "InUse") return error("只有使用中的实例可以查看 Studio 密码", 409);
+      const poolRows = inst.pool_id ? await sql`select config from pools where id = ${inst.pool_id} limit 1` : [];
+      const config = poolConfig(poolRows[0]?.config);
+      if (config.allow_user_studio === false) return error("当前资源池未开放 Studio 访问", 403);
+      const detail = parseObject(inst.detail);
+      const network = networkView(detail);
+      if (network.managed && network.state !== "applied") return error(`网络白名单尚未就绪（${network.state}）`, 409);
+      const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
+      const access = await studioAccessPayload(adapter, inst, config);
+      if (!access.studio_available) return error("Studio 凭据尚未初始化", 409);
+      const credential = await readStudioCredential(inst.id);
+      if (!credential?.initialized) return error("Studio 凭据尚未初始化", 409);
+      await writeAuditEvent(inst.id, "studio_password_reveal", "管理员查看 Studio 密码", {});
+      return json({
+        studio_url: access.studio_url,
+        studio_username: credential.username,
+        studio_password: credential.password,
+        agent_runtime_url: access.agent_runtime_url,
+      });
     }
 
     if (/^\/api\/instances\/[^/]+\/network$/.test(path) && method === "GET") {
@@ -5271,6 +6023,8 @@ async function handler(req: Request): Promise<Response> {
       const reservedApp = String(detail.reserved_app_name || "");
       if (reservedApp && reservedApp !== appName) return error(`该实例保留给应用 ${reservedApp}，不能分配给其他应用`);
       const poolRows = inst.pool_id ? await sql`select config from pools where id = ${inst.pool_id} limit 1` : [];
+      const studioGuard = await studioAllocationGuard(inst, poolRows[0] || {});
+      if (studioGuard) return error(studioGuard, 409);
       const policy = { ...networkPolicy(poolConfig(poolRows[0]?.config)), allow_public_access: true };
       let selection;
       try {
@@ -5341,6 +6095,51 @@ async function handler(req: Request): Promise<Response> {
       `;
       await writeAuditEvent(inst.id, "release", destroy ? "删除实例资源" : "保留给原应用复用", { destroy });
       return json({ task_id: taskId, destroy });
+    }
+
+    if (/^\/api\/(v1\/)?portal\/instances\/[^/]+\/access$/.test(path) && method === "GET") {
+      const ctx = await authenticate(req);
+      if (!hasScope(ctx, "instances:read")) return error("API Token 缺少 instances:read 权限", 403);
+      const id = path.split("/").slice(-2)[0];
+      const rows = await sql`select * from pool_instances where id = ${id} and owner_user_id = ${ctx!.user.id} and is_deleted = false limit 1`;
+      const inst: any = rows[0];
+      if (!inst) return error("实例不存在或不属于当前用户", 404);
+      if (inst.status !== "InUse") return error("实例尚未进入使用状态", 409);
+      const poolRows = inst.pool_id ? await sql`select config from pools where id = ${inst.pool_id} limit 1` : [];
+      const config = poolConfig(poolRows[0]?.config);
+      const detail = parseObject(inst.detail);
+      const network = networkView(detail);
+      const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
+      const access = await studioAccessPayload(adapter, inst, config);
+      return json({ ...access, network_state: network.state });
+    }
+
+    if (/^\/api\/(v1\/)?portal\/instances\/[^/]+\/access\/studio-password\/reveal$/.test(path) && method === "POST") {
+      const ctx = await authenticate(req);
+      if (!hasScope(ctx, "credentials:read")) return error("API Token 缺少 credentials:read 权限", 403);
+      const id = path.split("/").slice(-4)[0];
+      const rows = await sql`select * from pool_instances where id = ${id} and owner_user_id = ${ctx!.user.id} and is_deleted = false limit 1`;
+      const inst: any = rows[0];
+      if (!inst) return error("实例不存在或不属于当前用户", 404);
+      if (inst.status !== "InUse") return error("实例尚未进入使用状态", 409);
+      const poolRows = inst.pool_id ? await sql`select config from pools where id = ${inst.pool_id} limit 1` : [];
+      const config = poolConfig(poolRows[0]?.config);
+      if (config.allow_user_studio === false) return error("当前资源池未开放 Studio 访问", 403);
+      const detail = parseObject(inst.detail);
+      const network = networkView(detail);
+      if (network.managed && network.state !== "applied") return error(`网络白名单尚未就绪（${network.state}）`, 409);
+      const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
+      const access = await studioAccessPayload(adapter, inst, config);
+      if (!access.studio_available) return error("Studio 凭据尚未初始化", 409);
+      const credential = await readStudioCredential(inst.id);
+      if (!credential?.initialized) return error("Studio 凭据尚未初始化", 409);
+      await writeAuditEvent(inst.id, "studio_password_reveal", "使用者查看 Studio 密码", { username: ctx!.user.username });
+      return json({
+        studio_url: access.studio_url,
+        studio_username: credential.username,
+        studio_password: credential.password,
+        agent_runtime_url: access.agent_runtime_url,
+      });
     }
 
     if (/^\/api\/(v1\/)?portal\/instances\/[^/]+\/network$/.test(path) && method === "GET") {
@@ -5423,11 +6222,11 @@ async function handler(req: Request): Promise<Response> {
       const task: any = rows[0];
       if (!task || task.status !== "failed") return error("只有失败任务可以重试");
       if (task.target_id && task.kind !== "selfheal") {
-        const nextStatus = task.kind === "prewarm" ? "Creating" : task.kind === "release" ? "Releasing" : task.kind === "allocate" ? "InUse" : task.kind === "agent_runtime" ? "Creating" : "";
+        const nextStatus = task.kind === "prewarm" ? "Creating" : task.kind === "release" ? "Releasing" : task.kind === "allocate" ? "InUse" : ["agent_runtime", "studio_credentials"].includes(task.kind) ? "Creating" : "";
         if (nextStatus) await setInstance(task.target_id, { status: nextStatus, error: null });
         else await setInstance(task.target_id, { error: null });
       }
-      const nextStep = task.kind === "agent_runtime" ? "start" : task.kind === "prewarm" ? "prepare" : task.step || "prepare";
+      const nextStep = ["agent_runtime", "studio_credentials"].includes(task.kind) ? "start" : task.kind === "prewarm" ? "prepare" : task.step || "prepare";
       const nextId = randomId();
       await sql`
         insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)

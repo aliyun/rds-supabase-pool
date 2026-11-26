@@ -22,6 +22,8 @@ RDS Supabase Pool Console is an experimental control plane for pre-warming Supab
 - Task orchestration, retries, self-healing, API audit and pool cost views.
 - Real and mock cloud adapters.
 - Agent Runtime is enabled by default for newly prewarmed pooled instances and on return when needed.
+- PostgreSQL tags can be set at creation and fully synchronized for existing single and shared PGs.
+- Users can view Studio and Agent Runtime URLs; Studio credentials are generated per instance with audited reveal and return-time initialization.
 
 ## Architecture
 
@@ -52,7 +54,7 @@ Prerequisites:
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.2"
+export POOL_UI_RELEASE_TAG="v0.1.3"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<strong-password>"
@@ -68,7 +70,7 @@ export DINGTALK_SECRET="SEC..."   # required only for a signed robot
 ./edge/bootstrap.sh
 ```
 
-> Release mode requires `pool-ui-v0.1.2.ts` and its `.sha256` to be uploaded to the corresponding GitHub Release.
+> Release mode requires `pool-ui-v0.1.3.ts` and its `.sha256` to be uploaded to the corresponding GitHub Release.
 > For development or before a release exists, use `DEPLOY_UI=source ./edge/bootstrap.sh` (requires Node/npm).
 > To update the API only, use `DEPLOY_UI=0 ./edge/bootstrap.sh`.
 
@@ -91,17 +93,21 @@ full guide.
 
 ## Upgrade / recover an existing instance
 
-There is no need to rerun `bootstrap.sh` on an existing instance. With `edge/.bootstrap.env`, run:
+There is no need to rerun `bootstrap.sh` on an existing instance. With `edge/.bootstrap.env`, select the release UI and version explicitly (the file may still pin an older tag):
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 ./edge/upgrade.sh
 ```
 
-The script updates `pool-api`, `pool-ui`, `pool-notifier` and the watchdog, and runs a health check.
+To keep the UI settings saved in `.bootstrap.env`, you can also run `./edge/upgrade.sh` directly. The script updates `pool-api`, `pool-ui`, `pool-notifier` and the watchdog, and runs a health check.
 
 Without `.bootstrap.env`, provide the instance name, region and AK/SK:
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -113,6 +119,8 @@ WORKER_TOKEN="<existing worker token>" \
 If the existing `WORKER_TOKEN` is unavailable, there is no need to recover it. Reset it with:
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \

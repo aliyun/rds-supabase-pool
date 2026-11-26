@@ -127,8 +127,8 @@ pg_cron（每分钟）
 ```text
 预热 Creating → wait_running → [enable_agent_runtime → wait_agent_runtime] → close_network → stop → InCold
 申请：InCold/Available → start（如需要）→ wait_running → apply_network → InUse
-归还：InUse → reset_network（Cover 127.0.0.1）→ [enable_agent_runtime → wait_agent_runtime] → stop → InCold（保留给同名应用）
-删除：InCold/InUse → delete_supabase → Deleted
+归还：InUse → reset_network（Cover 127.0.0.1）→ [enable_agent_runtime → wait_agent_runtime] → [初始化/校验 Studio 凭据] → stop → InCold（保留给同名应用）
+删除：InCold/InUse → delete_supabase → delete_pg → 删除 Studio 凭据 → Deleted
 ```
 
 Supabase 实例网络白名单由任务状态机维护：
@@ -142,7 +142,19 @@ Supabase 实例网络白名单由任务状态机维护：
 
 真实模式下由 RealAdapter 调用 RDS / RdsAi；Mock 模式只写控制库并返回模拟资源。
 
-## 5. 认证与权限
+## 5. PG 标签与 Studio 访问
+
+- 单租 PG 默认标签保存在 `pools.config.single_pg_tags`；新 PG 通过 `CreateDBInstance.Tag` 写入。
+- 存量单租 PG 和共享 PG 的标签按 PG 维度全量同步，实际状态以 `ListTagResources` 为准。
+- 共享 PG 标签保存在 `shared_pgs.tags`；单租 PG 实际标签保存在 `pool_instances.pg_tags`。
+- 每个 Supabase 实例有独立 Studio 密码，密文保存在 `instance_credentials`，密钥由 `PLATFORM_JWT_SECRET` 通过 HKDF 派生。
+- Studio 和 Agent Runtime 地址由实例公网 443 Domain 派生：
+  - Studio: `https://<domain>/`
+  - Agent Runtime: `https://<domain>/agent-runtime`
+- Studio 凭据初始化、查看、归还处理都有审计；没有有效凭据的 InCold 实例禁止分配。
+- 池实例默认保留给同名应用，因此正常归还不会轮换仍有效的 Studio 密码；无凭据的存量实例会在归还时初始化一次。
+
+## 6. 认证与权限
 
 - 平台用户：`admin` / `user`
 - 浏览器使用 JWT Cookie
@@ -152,7 +164,7 @@ Supabase 实例网络白名单由任务状态机维护：
 - 使用者只能申请/归还，不能删除实例
 - 所有真实云写操作由管理员或任务 worker 执行
 
-## 6. 控制面配置
+## 7. 控制面配置
 
 `platform_config` 保存运行时配置：
 
@@ -163,7 +175,7 @@ Supabase 实例网络白名单由任务状态机维护：
 
 `pool_control_config` 在 `supabase_db` 保存当前控制库 URL（加密），支持控制库切换。
 
-## 7. 部署与环境
+## 8. 部署与环境
 
 - Edge Secrets：`CONTROL_DB_URL`、`PLATFORM_JWT_SECRET`、`WORKER_TOKEN`、云凭证、Supabase 应用密码等
 - `pool-api` 直连 PostgreSQL（`npm:postgres`）
@@ -171,7 +183,7 @@ Supabase 实例网络白名单由任务状态机维护：
 - 建议控制面实例与目标 PG/资源同地域、同 VPC，减少网络与延迟
 - 详细部署步骤见 [deployment.md](deployment.md)
 
-## 8. 设计取舍
+## 9. 设计取舍
 
 - **Edge 优先**：控制面不需要额外服务器；适合作为部署者侧轻量控制面。
 - **独立控制库**：与 `supabase_db` 解耦，升级、备份、切换更安全。

@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="${1:-}"
 if [ -z "$TAG" ]; then
   echo "用法：$0 <release-tag> [output-dir]" >&2
-  echo "例如：$0 v0.1.2" >&2
+  echo "例如：$0 v0.1.3" >&2
   exit 1
 fi
 case "$TAG" in

@@ -1,6 +1,6 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Boxes, Filter, Play, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Wrench, Zap } from "lucide-react";
+import { Boxes, Filter, KeyRound, Play, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Wrench, Zap } from "lucide-react";
 import { api } from "../lib/api";
 import { cx, MODE_META, relativeTime, STATUS_META } from "../lib/format";
 import { useAppData } from "../lib/store";
@@ -12,7 +12,7 @@ import { Button, Badge, Card, EmptyState, Input, Select, Spinner, StatusBadge, T
 type ModeFilter = "all" | PoolMode;
 
 export function InstancesPage() {
-  const { instances, meta, refreshAll, overview, loading } = useAppData();
+  const { instances, meta, regions, refreshAll, overview, loading } = useAppData();
   const { push } = useToast();
   const [searchParams, setSearchParams] = useSearchParams();
   const initialMode = (searchParams.get("mode") as ModeFilter) || "all";
@@ -30,6 +30,7 @@ export function InstancesPage() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [selfhealLoading, setSelfhealLoading] = useState(false);
   const [runtimeBackfillLoading, setRuntimeBackfillLoading] = useState(false);
+  const [studioBackfillLoading, setStudioBackfillLoading] = useState(false);
 
   const filtered = useMemo(() => {
     return instances.filter((instance) => {
@@ -92,6 +93,36 @@ export function InstancesPage() {
     (instance) => instance.status === "InCold" && instance.detail?.agent_runtime?.enabled !== true,
   ).length;
 
+  const studioDisabledPools = useMemo(
+    () => new Set(
+      regions
+        .flatMap((region) => region.pools)
+        .filter((pool) => pool.config?.allow_user_studio === false)
+        .map((pool) => pool.id),
+    ),
+    [regions],
+  );
+
+  const studioBackfillCandidates = instances.filter(
+    (instance) =>
+      instance.status === "InCold"
+      && !instance.studio_credentials_ready
+      && !studioDisabledPools.has(instance.pool_id || ""),
+  ).length;
+
+  const runStudioBackfill = async () => {
+    setStudioBackfillLoading(true);
+    try {
+      const result = await api.backfillStudioCredentials();
+      push("success", `已提交 ${result.count} 个 Studio 凭据初始化任务`);
+      await refreshAll();
+    } catch (error) {
+      push("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setStudioBackfillLoading(false);
+    }
+  };
+
   const runAgentRuntimeBackfill = async () => {
     setRuntimeBackfillLoading(true);
     try {
@@ -145,6 +176,15 @@ export function InstancesPage() {
                 onClick={() => void runAgentRuntimeBackfill()}
               >
                 启用 Agent Runtime{runtimeBackfillCandidates ? ` (${runtimeBackfillCandidates})` : ""}
+              </Button>
+              <Button
+                variant="secondary"
+                icon={<KeyRound size={14} />}
+                loading={studioBackfillLoading}
+                disabled={studioBackfillCandidates === 0}
+                onClick={() => void runStudioBackfill()}
+              >
+                初始化 Studio 凭据{studioBackfillCandidates ? ` (${studioBackfillCandidates})` : ""}
               </Button>
               <Button
                 variant="primary"

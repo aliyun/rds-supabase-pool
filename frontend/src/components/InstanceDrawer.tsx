@@ -29,8 +29,9 @@ import {
   STATUS_META,
 } from "../lib/format";
 import { useAppData } from "../lib/store";
-import type { AuditEvent, AuthInfo, DatabaseSizeInfo, EndpointsInfo, Instance, InstanceNetwork, ResourceInfo } from "../lib/types";
+import type { AuditEvent, AuthInfo, DatabaseSizeInfo, EndpointsInfo, Instance, InstanceNetwork, PgTag, ResourceInfo } from "../lib/types";
 import { AllocateModal, ConfirmDialog, ReleaseDialog } from "./PoolActions";
+import { TagEditor } from "./TagEditor";
 import {
   Badge,
   Button,
@@ -39,6 +40,7 @@ import {
   EmptyState,
   Field,
   Input,
+  Modal,
   Progress,
   Select,
   StatusBadge,
@@ -83,6 +85,10 @@ export function InstanceDrawer({
   const [resource, setResource] = useState<ResourceInfo | null>(null);
   const [size, setSize] = useState<DatabaseSizeInfo | null>(null);
   const [network, setNetwork] = useState<InstanceNetwork | null>(null);
+  const [pgTagOpen, setPgTagOpen] = useState(false);
+  const [pgTags, setPgTags] = useState<PgTag[]>([]);
+  const [pgTagLoading, setPgTagLoading] = useState(false);
+  const [pgTagSaving, setPgTagSaving] = useState(false);
   const [networkMode, setNetworkMode] = useState<"restricted" | "public">("restricted");
   const [networkCidrs, setNetworkCidrs] = useState("");
   const [savingNetwork, setSavingNetwork] = useState(false);
@@ -264,6 +270,8 @@ export function InstanceDrawer({
       ["实例 ID", instance.id],
       ["Supabase", instance.supabase_instance_id || "—"],
       ["底层 PG", instance.pg_instance_id || "—"],
+      ["PG 标签", (instance.pg_tags || []).map((tag) => `${tag.key}${tag.value ? `=${tag.value}` : ""}`).join(" · ") || "—"],
+      ["Studio 凭据", instance.studio_credentials_ready ? "已初始化" : "未初始化"],
       ["规格", instance.instance_class || "—"],
       ["地域 / 可用区", `${instance.region_id} / ${instance.detail?.cloud?.zone_id || "—"}`],
       ["VPC / VSwitch", `${instance.vpc_id || "—"} / ${instance.vswitch_id || "—"}`],
@@ -281,6 +289,36 @@ export function InstanceDrawer({
       ["最近检查", instance.last_checked_at ? relativeTime(instance.last_checked_at) : "—"],
     ];
   }, [instance]);
+
+  const openPgTags = async () => {
+    if (!instance) return;
+    setPgTagOpen(true);
+    setPgTagLoading(true);
+    try {
+      const data = await api.pgTags(instance.id);
+      setPgTags(data.tags || []);
+    } catch (error) {
+      push("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setPgTagLoading(false);
+    }
+  };
+
+  const savePgTags = async () => {
+    if (!instance) return;
+    setPgTagSaving(true);
+    try {
+      await api.updatePgTags(instance.id, pgTags);
+      push("success", "PG 标签已更新");
+      setPgTagOpen(false);
+      await load();
+      await refreshAll();
+    } catch (error) {
+      push("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setPgTagSaving(false);
+    }
+  };
 
   return (
     <>
@@ -389,9 +427,16 @@ export function InstanceDrawer({
                   </div>
                 ) : null}
                 <Card className="p-4" noCorners>
-                  <div className="mb-3 flex items-center gap-2">
-                    <Server size={14} className="text-cyan-400" />
-                    <span className="display-title text-xs text-slate-200">实例属性</span>
+                  <div className="mb-3 flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <Server size={14} className="text-cyan-400" />
+                      <span className="display-title text-xs text-slate-200">实例属性</span>
+                    </div>
+                    {instance.mode === "single" && instance.pg_instance_id ? (
+                      <Button size="sm" variant="ghost" loading={pgTagLoading} onClick={() => void openPgTags()}>
+                        编辑 PG 标签
+                      </Button>
+                    ) : null}
                   </div>
                   <div className="grid gap-x-6 gap-y-2 sm:grid-cols-2">
                     {detailRows.map(([label, value]) => (
@@ -756,6 +801,27 @@ export function InstanceDrawer({
           </div>
         )}
       </Drawer>
+
+      {instance && pgTagOpen ? (
+        <Modal
+          open
+          onClose={() => setPgTagOpen(false)}
+          title="单租 PG 标签"
+          subtitle={instance.pg_instance_id || ""}
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => setPgTagOpen(false)}>
+                取消
+              </Button>
+              <Button variant="primary" loading={pgTagSaving} onClick={() => void savePgTags()}>
+                保存标签
+              </Button>
+            </>
+          }
+        >
+          <TagEditor value={pgTags} onChange={setPgTags} disabled={pgTagSaving} />
+        </Modal>
+      ) : null}
 
       <AllocateModal instance={instance} open={allocateOpen} onClose={() => setAllocateOpen(false)} />
       <ReleaseDialog instance={instance} open={releaseOpen} onClose={() => setReleaseOpen(false)} />

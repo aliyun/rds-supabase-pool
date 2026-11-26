@@ -19,7 +19,7 @@ The deployment script does not create the control-plane instance.
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.2"
+export POOL_UI_RELEASE_TAG="v0.1.3"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<strong-password>"
@@ -51,7 +51,7 @@ performs a health check.
 ### UI deployment modes
 
 Customer deployments use a prebuilt GitHub Release artifact and do not require
-Node/npm. The corresponding release must contain `pool-ui-v0.1.2.ts` and its
+Node/npm. The corresponding release must contain `pool-ui-v0.1.3.ts` and its
 `.sha256`; the script verifies the checksum and aborts on mismatch.
 
 For source development or release building, use `DEPLOY_UI=source` (requires
@@ -64,10 +64,10 @@ DEPLOY_UI=source ./edge/bootstrap.sh
 To update only the API, use `DEPLOY_UI=0`. Build release assets with:
 
 ```bash
-./scripts/build-ui-release.sh v0.1.2
+./scripts/build-ui-release.sh v0.1.3
 ```
 
-Then upload `edge/.build/release/pool-ui-v0.1.2.ts` and `.sha256` to the
+Then upload `edge/.build/release/pool-ui-v0.1.3.ts` and `.sha256` to the
 corresponding GitHub Release. `POOL_UI_RELEASE_REPO` and
 `POOL_UI_RELEASE_URL` can override the default download location.
 
@@ -84,6 +84,8 @@ corresponding GitHub Release. `POOL_UI_RELEASE_REPO` and
 ### 5.1 With edge/.bootstrap.env
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 ./edge/upgrade.sh
 ```
 
@@ -92,14 +94,9 @@ corresponding GitHub Release. `POOL_UI_RELEASE_REPO` and
 health check. `deploy.sh` is an internal implementation detail and does not
 need to be invoked by customers.
 
-If `edge/.bootstrap.env` still pins an older UI tag such as `v0.1.1`, select the
-new UI explicitly:
-
-```bash
-POOL_UI_RELEASE_TAG=v0.1.2 ./edge/upgrade.sh
-```
-
-You can also change `POOL_UI_RELEASE_TAG` in `edge/.bootstrap.env` to `v0.1.2`.
+To keep the UI settings saved in `.bootstrap.env`, you can also run
+`./edge/upgrade.sh` directly, or change `POOL_UI_RELEASE_TAG` in that file to
+`v0.1.3`.
 
 ### 5.2 Without edge/.bootstrap.env
 
@@ -107,6 +104,8 @@ If the upgrade host has no `.bootstrap.env`, provide the instance name, region
 and AK/SK:
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -123,6 +122,8 @@ If the control-plane URL and service key are already known, you can skip the
 instance lookup:
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 SUPABASE_URL="https://<domain>" \
 SUPABASE_SERVICE_KEY="<service-key>" \
 WORKER_TOKEN="<existing worker token>" \
@@ -139,6 +140,8 @@ generates a new token, updates the Edge Secret, redeploys the functions and
 re-hooks the scheduler:
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -162,6 +165,27 @@ Reset impact:
 
 Do not use `bootstrap.sh` to upgrade or recover an existing instance. It
 rewrites the JWT secret, database passwords and the full set of Edge Secrets.
+
+### PostgreSQL tags and Studio access
+
+PostgreSQL tag management requires `rds:TagResources`, `rds:ListTagResources`
+and `rds:UntagResources`. Studio credential initialization and rotation require
+`rdsai:ResetInstancePassword`.
+
+Pool settings `allow_user_studio` and `allow_user_agent_runtime` default to
+`true`. Users can open:
+
+```text
+Studio:        https://<instance-public-domain>/
+Agent Runtime: https://<instance-public-domain>/agent-runtime
+```
+
+Studio uses username `supabase` and an independent encrypted password per
+instance. The current RDS Supabase Studio entry uses HTTP Basic authentication,
+so the browser prompts for these credentials. Existing InCold instances can be initialized from the admin console
+in batches of up to five; existing InUse instances are initialized when
+returned if no credential exists. An InCold instance without an initialized
+credential is not allocatable while Studio access is enabled.
 
 ## 6. Monitoring and alerts
 

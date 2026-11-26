@@ -104,7 +104,7 @@ fi
 # tag saved by the initial deployment. Caller overrides still win.
 export SUPABASE_URL SUPABASE_SERVICE_KEY WORKER_TOKEN
 export DEPLOY_UI="${CALLER_DEPLOY_UI:-release}"
-export POOL_UI_RELEASE_TAG="${CALLER_UI_TAG:-${POOL_UI_RELEASE_TAG:-v0.1.2}}"
+export POOL_UI_RELEASE_TAG="${CALLER_UI_TAG:-${POOL_UI_RELEASE_TAG:-v0.1.3}}"
 [ -n "${POOL_UI_RELEASE_REPO:-}" ] && export POOL_UI_RELEASE_REPO
 [ -n "${POOL_UI_RELEASE_URL:-}" ] && export POOL_UI_RELEASE_URL
 [ -n "${POOL_UI_RELEASE_CHECKSUM_URL:-}" ] && export POOL_UI_RELEASE_CHECKSUM_URL

@@ -18,6 +18,7 @@ import { api } from "../lib/api";
 import { cx, MODE_META, relativeTime } from "../lib/format";
 import { useAppData } from "../lib/store";
 import { ConfirmDialog } from "../components/PoolActions";
+import { TagEditor } from "../components/TagEditor";
 import {
   Badge,
   Button,
@@ -33,7 +34,7 @@ import {
   Toggle,
   useToast,
 } from "../components/ui";
-import type { PgInstance, PoolSettings, Region, RegionPool, SharedPg, VSwitch, Vpc } from "../lib/types";
+import type { PgInstance, PgTag, PoolSettings, Region, RegionPool, SharedPg, VSwitch, Vpc } from "../lib/types";
 
 export function PoolsPage() {
   const { regions, regionId, setRegion, refreshRegions, refreshAll } = useAppData();
@@ -144,6 +145,7 @@ function RegionCard({
   const [removeTarget, setRemoveTarget] = useState<SharedPg | null>(null);
   const [removeDeleteCloud, setRemoveDeleteCloud] = useState(false);
   const [busyPg, setBusyPg] = useState<string | null>(null);
+  const [tagTarget, setTagTarget] = useState<SharedPg | null>(null);
 
   const single = region.pools.find((item) => item.mode === "single");
   const shared = region.pools.find((item) => item.mode === "shared");
@@ -343,6 +345,15 @@ function RegionCard({
                       <td className="px-3 py-2.5">
                         <div className="text-slate-300">{pg.name || pg.pg_instance_id}</div>
                         <div className="mono text-[10px] text-slate-600">{pg.pg_instance_id}</div>
+                        {pg.tags?.length ? (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {pg.tags.map((tag) => (
+                              <Badge key={`${tag.key}:${tag.value}`} className="border-violet/25 bg-violet/[0.07] text-violet-200">
+                                {tag.key}{tag.value ? `=${tag.value}` : ""}
+                              </Badge>
+                            ))}
+                          </div>
+                        ) : null}
                       </td>
                       <td className="px-3 py-2.5">
                         <div className="flex flex-wrap items-center gap-1.5">
@@ -386,6 +397,14 @@ function RegionCard({
                             size="sm"
                             variant="ghost"
                             disabled={busyPg === pg.pg_instance_id}
+                            onClick={() => setTagTarget(pg)}
+                          >
+                            标签
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            disabled={busyPg === pg.pg_instance_id}
                             onClick={() => void toggleSharedPg(pg, !pg.enabled)}
                           >
                             {pg.enabled ? "停用" : "启用"}
@@ -422,6 +441,18 @@ function RegionCard({
           onClose={() => setEditPool(null)}
           onSaved={() => {
             setEditPool(null);
+            onChanged();
+          }}
+        />
+      ) : null}
+
+      {tagTarget ? (
+        <SharedPgTagsModal
+          pg={tagTarget}
+          onClose={() => setTagTarget(null)}
+          onSaved={() => {
+            setTagTarget(null);
+            void loadSharedPgs();
             onChanged();
           }}
         />
@@ -838,6 +869,16 @@ function PoolConfigModal({ pool, onClose, onSaved }: { pool: RegionPool; onClose
               onChange={(value) => setConfig({ ...config, agent_runtime_enabled: value })}
               label="启用 Agent Runtime"
             />
+            <Toggle
+              checked={config.allow_user_studio !== false}
+              onChange={(value) => setConfig({ ...config, allow_user_studio: value })}
+              label="使用者可访问 Studio"
+            />
+            <Toggle
+              checked={config.allow_user_agent_runtime !== false}
+              onChange={(value) => setConfig({ ...config, allow_user_agent_runtime: value })}
+              label="使用者可访问 Agent Runtime"
+            />
           </div>
           <div className="mt-2 text-[10px] leading-5 text-slate-500">
             默认开启；仅对后续新预热实例及归还时补启用的实例生效。启用会增加约 2~5 分钟预热/归还时间，并可能创建 VPC 终端节点和安全组。
@@ -937,6 +978,14 @@ function PoolConfigModal({ pool, onClose, onSaved }: { pool: RegionPool; onClose
                 <Input
                   value={config.single_pg_security_ips}
                   onChange={(event) => setConfig({ ...config, single_pg_security_ips: event.target.value })}
+                />
+              </Field>
+            </div>
+            <div className="mt-4 border-t border-edge/60 pt-3">
+              <Field label="单租 PG 标签" hint="仅对后续新建单租 PG 生效">
+                <TagEditor
+                  value={config.single_pg_tags || []}
+                  onChange={(tags) => setConfig({ ...config, single_pg_tags: tags })}
                 />
               </Field>
             </div>
@@ -1141,6 +1190,7 @@ function AddSharedPgModal({
   const [pgStorage, setPgStorage] = useState(String(pool.config.shared_pg_storage || 20));
   const [pgEngine, setPgEngine] = useState(pool.config.shared_pg_engine_version || "18.0");
   const [pgZone, setPgZone] = useState(pool.zone_id || "");
+  const [tags, setTags] = useState<PgTag[]>([]);
 
   const load = async () => {
     setLoading(true);
@@ -1172,7 +1222,11 @@ function AddSharedPgModal({
     }
     setAdding(true);
     try {
-      await api.addSharedPg(poolId, { pg_instance_id: target, name: name.trim() });
+      await api.addSharedPg(poolId, {
+        pg_instance_id: target,
+        name: name.trim(),
+        ...(tags.length ? { tags } : {}),
+      });
       push("success", "共享 PG 已加入共享池");
       onAdded();
     } catch (error) {
@@ -1191,6 +1245,7 @@ function AddSharedPgModal({
         storage_gb: Number(pgStorage) || 20,
         engine_version: pgEngine.trim(),
         zone_id: pgZone.trim(),
+        tags,
       });
       push("success", `共享 PG 创建任务已提交：${result.task_id}`);
       onAdded();
@@ -1299,7 +1354,65 @@ function AddSharedPgModal({
             </div>
           </>
         )}
+
+        <div className="rounded-xl border border-edge bg-white/[0.02] p-4">
+          <div className="display-title text-xs text-slate-200">PG 标签</div>
+          <div className="mt-1 text-[10px] leading-5 text-slate-500">
+            新建 PG 时写入云端；加入已有 PG 时填写标签会同步到该 PG。留空不修改已有 PG 标签。
+          </div>
+          <div className="mt-3">
+            <TagEditor value={tags} onChange={setTags} />
+          </div>
+        </div>
       </div>
+    </Modal>
+  );
+}
+
+function SharedPgTagsModal({
+  pg,
+  onClose,
+  onSaved,
+}: {
+  pg: SharedPg;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { push } = useToast();
+  const [tags, setTags] = useState<PgTag[]>(pg.tags || []);
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.updateSharedPg(pg.pg_instance_id, { tags });
+      push("success", "共享 PG 标签已同步");
+      onSaved();
+    } catch (error) {
+      push("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="共享 PG 标签"
+      subtitle={pg.pg_instance_id}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            取消
+          </Button>
+          <Button variant="primary" icon={<Save size={14} />} loading={saving} onClick={() => void save()}>
+            保存标签
+          </Button>
+        </>
+      }
+    >
+      <TagEditor value={tags} onChange={setTags} disabled={saving} />
     </Modal>
   );
 }

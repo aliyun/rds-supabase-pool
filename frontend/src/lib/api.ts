@@ -8,11 +8,13 @@ import type {
   EndpointsInfo,
   GlobalOverview,
   Instance,
+  InstanceAccess,
   InstanceNetwork,
   MetaInfo,
   MetadataStatus,
   Overview,
   PgInstance,
+  PgTag,
   PlatformRole,
   PlatformToken,
   PlatformUser,
@@ -26,6 +28,7 @@ import type {
   ResourceInfo,
   Settings,
   SetupJob,
+  StudioSecret,
   SharedPg,
   TaskRecord,
   VSwitch,
@@ -127,6 +130,9 @@ export const api = {
   portalInstance: (id: string) => request<PortalInstance>(`/portal/instances/${id}`),
   portalEndpoints: (id: string) => request<EndpointsInfo>(`/portal/instances/${id}/endpoints`),
   portalAuthInfo: (id: string) => request<AuthInfo>(`/portal/instances/${id}/auth-info`),
+  portalAccess: (id: string) => request<InstanceAccess>(`/portal/instances/${id}/access`),
+  revealStudio: (id: string) =>
+    request<StudioSecret>(`/portal/instances/${id}/access/studio-password/reveal`, { method: "POST" }),
 
   health: () => request<Record<string, unknown>>("/health"),
   meta: () => request<MetaInfo>("/meta"),
@@ -150,20 +156,20 @@ export const api = {
     },
   ) => request<RegionPool>(`/pools/${encodeURIComponent(poolId)}`, { method: "PATCH", body: JSON.stringify(patch) }),
   sharedPgs: (poolId: string) => request<{ shared_pgs: SharedPg[] }>(`/pools/${encodeURIComponent(poolId)}/shared-pgs`),
-  addSharedPg: (poolId: string, body: { pg_instance_id: string; name?: string }) =>
+  addSharedPg: (poolId: string, body: { pg_instance_id: string; name?: string; tags?: PgTag[] }) =>
     request<SharedPg>(`/pools/${encodeURIComponent(poolId)}/shared-pgs`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
   createSharedPg: (
     poolId: string,
-    body: { name?: string; instance_class?: string; storage_gb?: number; engine_version?: string; zone_id?: string },
+    body: { name?: string; instance_class?: string; storage_gb?: number; engine_version?: string; zone_id?: string; tags?: PgTag[] },
   ) =>
     request<{ task_id: string; pool_id: string; name: string }>(
       `/pools/${encodeURIComponent(poolId)}/shared-pgs/create`,
       { method: "POST", body: JSON.stringify(body) },
     ),
-  updateSharedPg: (pgId: string, patch: { name?: string; enabled?: boolean; weight?: number }) =>
+  updateSharedPg: (pgId: string, patch: { name?: string; enabled?: boolean; weight?: number; tags?: PgTag[] }) =>
     request<SharedPg>(`/shared-pgs/${encodeURIComponent(pgId)}`, { method: "PATCH", body: JSON.stringify(patch) }),
   removeSharedPg: (pgId: string, deleteCloud = false) =>
     request<{ removed: boolean; pg_instance_id: string; cloud_deleted: boolean }>(
@@ -229,6 +235,18 @@ export const api = {
     request<{ task_ids: string[]; count: number }>("/instances/backfill-agent-runtime", {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+  backfillStudioCredentials: (body: { pool_id?: string; region_id?: string; limit?: number } = {}) =>
+    request<{ task_ids: string[]; count: number }>("/instances/backfill-studio-credentials", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  pgTags: (id: string) =>
+    request<{ pg_instance_id: string; tags: PgTag[] }>(`/instances/${id}/pg-tags`),
+  updatePgTags: (id: string, tags: PgTag[]) =>
+    request<{ pg_instance_id: string; tags: PgTag[] }>(`/instances/${id}/pg-tags`, {
+      method: "PATCH",
+      body: JSON.stringify({ tags }),
     }),
   allocate: (id: string, body: { app_name: string; user?: string }) =>
     request<{ task_id: string; instance_id: string; bound_app_id: string }>(`/instances/${id}/allocate`, {

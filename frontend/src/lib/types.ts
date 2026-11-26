@@ -2,6 +2,11 @@ export type CloudMode = "real" | "mock";
 export type PoolMode = "single" | "shared";
 export type NetworkMode = "restricted" | "public";
 
+export interface PgTag {
+  key: string;
+  value: string;
+}
+
 export interface NetworkPolicy {
   allow_user_edit: boolean;
   allow_public_access: boolean;
@@ -43,9 +48,28 @@ export interface PoolSettings {
   shared_pg_category: string;
   shared_pg_engine_version: string;
   single_pg_security_ips: string;
+  single_pg_tags: PgTag[];
   public_endpoint_enabled: boolean;
   network_policy: NetworkPolicy;
   agent_runtime_enabled: boolean;
+  allow_user_studio: boolean;
+  allow_user_agent_runtime: boolean;
+}
+
+export interface InstanceAccess {
+  studio_url: string;
+  studio_username: string;
+  studio_available: boolean;
+  agent_runtime_url: string;
+  agent_runtime_available: boolean;
+  network_state?: string;
+}
+
+export interface StudioSecret {
+  studio_url: string;
+  studio_username: string;
+  studio_password: string;
+  agent_runtime_url: string;
 }
 
 export interface MetadataPgSettings {
@@ -198,6 +222,7 @@ export interface SharedPg {
   weight: number;
   reserved_slots: number;
   tenant_count: number;
+  tags: PgTag[];
   active_tenant_count?: number;
   capacity: Capacity;
   last_checked_at: string | null;
@@ -417,6 +442,8 @@ export interface Instance {
   vpc_id: string | null;
   vswitch_id: string | null;
   pg_instance_id: string | null;
+  pg_tags: PgTag[];
+  studio_credentials_ready?: boolean;
   supabase_instance_id: string | null;
   instance_class: string;
   cloud_status: string | null;

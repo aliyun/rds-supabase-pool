@@ -174,7 +174,7 @@ export AUTO_WHITELIST=false
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.2"
+export POOL_UI_RELEASE_TAG="v0.1.3"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<8~32 位，至少含大写/小写/数字/特殊字符中的三类>"
@@ -194,7 +194,7 @@ export DINGTALK_SECRET="SEC..."   # 仅钉钉机器人使用“加签”时需�
 
 ### UI 部署模式
 
-客户部署默认使用 Release 产物，无需安装 Node/npm；前提是对应 GitHub Release 已上传 `pool-ui-v0.1.2.ts` 和 `.sha256`。脚本会下载并校验 SHA256，校验失败会中止。
+客户部署默认使用 Release 产物，无需安装 Node/npm；前提是对应 GitHub Release 已上传 `pool-ui-v0.1.3.ts` 和 `.sha256`。脚本会下载并校验 SHA256，校验失败会中止。
 
 源码开发或发版时使用 `DEPLOY_UI=source`（脚本默认值，需要 Node 20.19+）：
 
@@ -211,10 +211,10 @@ DEPLOY_UI=0 ./edge/bootstrap.sh
 构建 Release 产物：
 
 ```bash
-./scripts/build-ui-release.sh v0.1.2
+./scripts/build-ui-release.sh v0.1.3
 ```
 
-生成 `edge/.build/release/pool-ui-v0.1.2.ts` 和 `.sha256`，上传到对应 GitHub Release 即可。可用 `POOL_UI_RELEASE_REPO`、`POOL_UI_RELEASE_URL` 覆盖默认下载地址。
+生成 `edge/.build/release/pool-ui-v0.1.3.ts` 和 `.sha256`，上传到对应 GitHub Release 即可。可用 `POOL_UI_RELEASE_REPO`、`POOL_UI_RELEASE_URL` 覆盖默认下载地址。
 
 脚本会调用 RdsAi/RDS API 自动解析：
 
@@ -316,27 +316,25 @@ https://<domain>/functions/v1/pool-api
 
 ### 9.1 正常升级
 
-已有 `edge/.bootstrap.env` 时，直接执行：
+已有 `edge/.bootstrap.env` 时，升级到本版本需显式指定 Release UI 和版本（文件中可能仍保存旧 tag）：
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 ./edge/upgrade.sh
 ```
 
 `upgrade.sh` 会自动读取部署坐标，更新 `pool-api`、`pool-ui`、`pool-notifier`，重挂 worker/watchdog，并执行健康检查。`deploy.sh` 只作为内部部署实现，客户不需要直接调用。
 
-如果 `.bootstrap.env` 中保存的还是旧 UI tag（例如 `v0.1.1`），升级到新 UI 时需要显式覆盖：
-
-```bash
-POOL_UI_RELEASE_TAG=v0.1.2 ./edge/upgrade.sh
-```
-
-也可以直接把 `.bootstrap.env` 中的 `POOL_UI_RELEASE_TAG` 改成 `v0.1.2`。
+如果只想沿用 `.bootstrap.env` 中保存的 UI 配置，也可以直接执行 `./edge/upgrade.sh`。也可以直接把 `.bootstrap.env` 中的 `POOL_UI_RELEASE_TAG` 改成 `v0.1.3`。
 
 ### 9.2 没有 .bootstrap.env
 
 如果升级机器上没有 `.bootstrap.env`，但能提供控制面实例名、地域和 AK/SK，可以直接升级：
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -350,6 +348,8 @@ WORKER_TOKEN="<原 worker token>" \
 如果已经知道控制面地址和 service key，也可以跳过实例解析：
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 SUPABASE_URL="https://<domain>" \
 SUPABASE_SERVICE_KEY="<service-key>" \
 WORKER_TOKEN="<原 worker token>" \
@@ -363,6 +363,8 @@ WORKER_TOKEN="<原 worker token>" \
 如果不知道原 `WORKER_TOKEN`，设置 `RESET_WORKER_TOKEN=1`。脚本会自动生成新 token、更新 Edge Secret、重新部署函数并重挂 scheduler：
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -388,7 +390,22 @@ RESET_WORKER_TOKEN=1 \
 - 调度使用 Edge 内部 `SUPABASE_URL`（VPC 地址），不会因为重新部署而变化。
 - Secrets 接口不会回显明文；`WORKER_TOKEN` 以本地 `.bootstrap.env` 为准，丢失时使用 `RESET_WORKER_TOKEN=1`。
 
-### 9.4 监控与告警（可选）
+### 9.4 Studio / Agent Runtime
+
+资源池设置中的 `allow_user_studio` 和 `allow_user_agent_runtime` 默认开启，管理员可以按池关闭。
+
+Studio 和 Agent Runtime 都通过实例公网域名访问：
+
+```text
+Studio:         https://<实例公网域名>/
+Agent Runtime:  https://<实例公网域名>/agent-runtime
+```
+
+Studio 用户名固定为 `supabase`，密码按实例独立生成并加密保存在控制面。当前 RDS Supabase 的 Studio 入口使用 HTTP Basic 认证；浏览器打开地址后输入 `supabase` 和该实例密码。使用者需要在门户中点击“显示密码”后查看，查看动作会记录审计日志。
+
+已有 InCold 实例可以在实例页执行“初始化 Studio 凭据”批量任务，每批最多 5 台。已有 InUse 实例在归还时如果没有凭据会自动初始化；同一应用保留复用时不会轮换密码。轮换失败会阻止该实例再次分配，管理员需要重试或处理失败任务。
+
+### 9.5 监控与告警（可选）
 
 控制面会记录两类 heartbeat：
 
@@ -519,7 +536,10 @@ curl -H "X-Worker-Token: <WORKER_TOKEN>" \
         "rds:CreateAccount",
         "rds:CreateDatabase",
         "rds:ResetAccountPassword",
-        "rds:GrantAccountPrivilege"
+        "rds:GrantAccountPrivilege",
+        "rds:TagResources",
+        "rds:ListTagResources",
+        "rds:UntagResources"
       ],
       "Resource": "*"
     },
@@ -542,7 +562,8 @@ curl -H "X-Worker-Token: <WORKER_TOKEN>" \
         "rdsai:ModifyInstanceIpWhitelist",
         "rdsai:DescribeDBInstanceCapacity",
         "rdsai:ModifyDBInstanceCapacity",
-        "rdsai:EnableAgentRuntime"
+        "rdsai:EnableAgentRuntime",
+        "rdsai:ResetInstancePassword"
       ],
       "Resource": "*"
     },
@@ -578,6 +599,8 @@ curl -H "X-Worker-Token: <WORKER_TOKEN>" \
 - `rdsai:EnableAgentRuntime` 用于控制面实例，以及开启池级 `agent_runtime_enabled` 后的池中 Supabase 实例；如果不启用池实例 Agent Runtime 且控制面由主账号创建，可以不授予。
 - `rdsai:DescribeInstanceIpWhitelist` / `rdsai:ModifyInstanceIpWhitelist` 用于池中 Supabase 实例的生命周期白名单管理，必须授予；它和 PostgreSQL 的 `rds:ModifySecurityIps` 是两套权限。
 - Edge 的自动白名单依赖 `rds:ModifySecurityIps`；不授予时设置 `AUTO_WHITELIST=false` 并手动加白。
+- `rds:TagResources` / `rds:ListTagResources` / `rds:UntagResources` 用于单租和共享 PG 标签创建、读取和全量同步；不授予时标签编辑会失败。
+- `rdsai:ResetInstancePassword` 用于 Studio 凭据初始化，以及归还时按策略处理密码；不授予时 Studio 密码初始化和轮换不可用。
 - 使用 RAM 用户的 AK/SK 填入 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET`，不需要使用主账号 AK。
 - 如果账号已有 RDS / RdsAi 的系统策略，也可以直接附加对应系统策略；上面的 JSON 适合做最小权限收敛。
 - 所有资源创建在所属阿里云账号下，RAM 用户只是操作者；账单仍归属主账号。

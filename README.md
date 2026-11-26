@@ -23,6 +23,8 @@ RDS Supabase Pool Console 是一个面向 RDS Supabase 的冷热资源池控制�
 - **双角色边界**：管理员管理资源池与生命周期；使用者通过独立门户或 CLI 自助申请、查看连接信息并归还，全程不接触云账号凭证。
 - **真实 / Mock 双模式**：Mock 模式用于本地和演示；真实模式调用阿里云 RDS / RdsAi OpenAPI。
 - **Agent Runtime**：池级开关默认开启，新预热和未启用的实例归还时会启用沙箱和 Edge Functions。
+- **PG 标签**：单租和共享 PG 支持创建时打标签，存量 PG 支持管理员全量同步标签。
+- **Studio / Agent Runtime 入口**：使用者可在门户查看 Studio 和 Agent Runtime 地址；Studio 凭据按实例独立生成，支持查看审计和归还初始化。
 - **运维能力**：任务状态机、失败重试、自愈巡检、API 审计、池成本统计、SSE 实时状态。
 
 ## 架构
@@ -57,7 +59,7 @@ flowchart LR
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.2"
+export POOL_UI_RELEASE_TAG="v0.1.3"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<8~32 位，至少包含大写/小写/数字/特殊字符中的三类>"
@@ -73,7 +75,7 @@ export DINGTALK_SECRET="SEC..."   # required only for a signed robot
 ./edge/bootstrap.sh
 ```
 
-> Release 模式需要对应 GitHub Release 已上传 `pool-ui-v0.1.2.ts` 和 `.sha256`。
+> Release 模式需要对应 GitHub Release 已上传 `pool-ui-v0.1.3.ts` 和 `.sha256`。
 > 开发或尚未发布 Release 时，使用源码构建：`DEPLOY_UI=source ./edge/bootstrap.sh`（需要 Node/npm）。
 > 只更新 API：`DEPLOY_UI=0 ./edge/bootstrap.sh`。
 
@@ -114,17 +116,21 @@ export CLOUD_MODE="real"
 
 ## 已有实例升级 / 服务异常恢复
 
-已有实例无需重新执行 `bootstrap.sh`。有 `edge/.bootstrap.env` 时直接执行：
+已有实例无需重新执行 `bootstrap.sh`。有 `edge/.bootstrap.env` 时，升级到本版本需显式指定 Release UI 和版本（文件中可能仍保存旧 tag）：
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 ./edge/upgrade.sh
 ```
 
-脚本会更新 `pool-api`、`pool-ui`、`pool-notifier` 和 watchdog，并执行健康检查。
+如果只想沿用 `.bootstrap.env` 中保存的 UI 配置，也可以直接执行 `./edge/upgrade.sh`。脚本会更新 `pool-api`、`pool-ui`、`pool-notifier` 和 watchdog，并执行健康检查。
 
 没有 `.bootstrap.env` 时，可以提供实例名、地域和 AK/SK：
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -136,6 +142,8 @@ WORKER_TOKEN="<原 worker token>" \
 如果原 `WORKER_TOKEN` 已丢失，不需要找回，使用下面的命令重置：
 
 ```bash
+DEPLOY_UI="release" \
+POOL_UI_RELEASE_TAG="v0.1.3" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -178,6 +186,8 @@ poolctl release my-app --yes --wait
 - **`DINGTALK_WEBHOOK` 是外部告警开关**：设置后启用钉钉投递；未设置时 heartbeat、watchdog 和 outbox 仍工作，但不会调用 notifier，也不会影响主业务。
 - `DINGTALK_SECRET` 仅在钉钉机器人使用「加签」时需要；使用自定义关键词时可以不配置。
 - 首次部署时把这两个变量传给 `bootstrap.sh`，脚本会写入 Edge Secrets。
+- 资源池默认开放 Studio 和 Agent Runtime 使用者入口，管理员可在池参数中关闭。
+- 存量 InCold 实例可在实例页批量初始化 Studio 凭据；InUse 实例在归还时自动初始化。
 - 已有实例重新部署使用 `./edge/upgrade.sh`；它会更新 `pool-api` / `pool-ui` / `pool-notifier` 并重挂 watchdog。除显式 `RESET_WORKER_TOKEN=1` 外不会修改 Edge Secrets；如需新增或更换 webhook，可执行：
 
 ```bash

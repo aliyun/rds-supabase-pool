@@ -72,9 +72,9 @@ All routes below require an admin session unless noted.
 | GET    | `/pools/:pool_id`                   | Get one pool                                                     |
 | PATCH  | `/pools/:pool_id`                   | Update pool network or config                                    |
 | GET    | `/pools/:pool_id/shared-pgs`        | List shared PGs in a shared pool                                 |
-| POST   | `/pools/:pool_id/shared-pgs`        | Attach an existing Running PG                                    |
-| POST   | `/pools/:pool_id/shared-pgs/create` | Create a shared PG asynchronously                                |
-| PATCH  | `/shared-pgs/:pg_id`                | Update shared PG name, weight or enabled state                   |
+| POST   | `/pools/:pool_id/shared-pgs`        | Attach an existing Running PG; optional tags                    |
+| POST   | `/pools/:pool_id/shared-pgs/create` | Create a shared PG asynchronously; optional tags                |
+| PATCH  | `/shared-pgs/:pg_id`                | Update shared PG name, weight, enabled state or tags            |
 | DELETE | `/shared-pgs/:pg_id`                | Remove a shared PG; add `?delete_cloud=1` to delete the cloud PG |
 | POST   | `/shared-pgs/:pg_id/sync`           | Refresh cloud status and capacity snapshot                       |
 
@@ -94,6 +94,7 @@ All routes below require an admin session unless noted.
 | GET    | `/instances`                   | List instances; filters include `region_id`, `mode`, `status`, `pool_id` |
 | POST   | `/instances/prewarm`           | Prewarm one or more instances                                            |
 | POST   | `/instances/backfill-agent-runtime` | Enable Agent Runtime on eligible InCold instances                    |
+| POST   | `/instances/backfill-studio-credentials` | Initialize Studio credentials for eligible InCold instances      |
 | GET    | `/instances/:id`               | Instance detail                                                          |
 | DELETE | `/instances/:id`               | Delete an instance and its cloud resources                               |
 | GET    | `/instances/:id/events`        | Instance audit timeline                                                  |
@@ -102,6 +103,10 @@ All routes below require an admin session unless noted.
 | POST   | `/instances/:id/release`       | Return or destroy                                                        |
 | GET    | `/instances/:id/network`       | Read the Supabase instance IP allowlist                                  |
 | PATCH  | `/instances/:id/network`       | Replace the Supabase instance IP allowlist                               |
+| GET    | `/instances/:id/pg-tags`       | Read PostgreSQL instance tags                                            |
+| PATCH  | `/instances/:id/pg-tags`       | Fully synchronize PostgreSQL instance tags                               |
+| GET    | `/instances/:id/access`        | Studio / Agent Runtime URLs and availability                             |
+| POST   | `/instances/:id/access/studio-password/reveal` | Reveal the instance Studio password                     |
 | GET    | `/instances/:id/endpoints`     | Supabase endpoints                                                       |
 | GET    | `/instances/:id/auth-info`     | Supabase API keys (masked in UI)                                         |
 | GET    | `/instances/:id/resource`      | Current resource configuration                                           |
@@ -155,6 +160,8 @@ Portal endpoints are available both under `/portal/*` for session cookies and
 | POST     | `/v1/portal/instances/:id/release`   | Return an owned instance                        |
 | GET      | `/v1/portal/instances/:id/network`   | Read own Supabase IP allowlist (requires `network:read`) |
 | PATCH    | `/v1/portal/instances/:id/network`   | Update own Supabase IP allowlist (requires `network:write`) |
+| GET      | `/v1/portal/instances/:id/access`    | Studio / Agent Runtime URLs and availability    |
+| POST     | `/v1/portal/instances/:id/access/studio-password/reveal` | Studio password; requires `credentials:read` |
 | GET      | `/v1/portal/instances/:id/endpoints` | Connection endpoints                            |
 | GET      | `/v1/portal/instances/:id/auth-info` | API keys; requires `credentials:read`           |
 | GET      | `/v1/portal/tasks/:id`               | Task status                                     |
@@ -216,6 +223,41 @@ When enabled, prewarm waits for Supabase to become `Running`, calls
 active before closing the network allowlist and stopping the instance. This
 adds roughly 2-5 minutes to prewarm time and may create a VPC endpoint and
 security group on first use in a VPC. The setting applies to new prewarm tasks and conditional enablement during return. Existing InCold instances can be backfilled with `POST /instances/backfill-agent-runtime`; InUse instances are handled on normal return.
+
+## PostgreSQL tags
+
+Single-tenant PG defaults are stored in `pools.config.single_pg_tags`. New
+single PGs are created with those tags; existing single PGs can be updated from
+the admin instance detail. Shared PG tags are stored per PG in
+`shared_pgs.tags` and can be set when creating, adding or editing a shared PG.
+
+Tag updates use a full synchronization model: submitted tags are the desired
+state, new/changed keys use `TagResources`, and omitted old keys use
+`UntagResources`. Limits: at most 20 tags per PG, keys must be unique and
+non-empty, values may be empty.
+
+## Studio and Agent Runtime
+
+Pool settings `allow_user_studio` and `allow_user_agent_runtime` default to
+`true`; an administrator can disable either per pool.
+
+- Studio URL: `https://<instance-public-domain>/`
+- Agent Runtime URL: `https://<instance-public-domain>/agent-runtime`
+- Studio uses HTTP Basic auth in the current RDS Supabase deployment; use username `supabase` and the instance Studio password.
+- Each instance has an independent Studio password, stored encrypted in the
+  control plane.
+- The password is not returned by list endpoints. It is revealed explicitly by
+  the owner or an administrator and the reveal is audited.
+- New instances receive a credential automatically.
+- Existing InCold instances can be initialized with
+  `POST /instances/backfill-studio-credentials` (up to 5 per batch).
+- Existing InUse instances are initialized on return if no credential exists.
+- If Studio access is enabled and an InCold instance has no initialized
+  credential, allocation is rejected until the administrator initializes it.
+- A failed credential rotation marks the instance as `studio_rotation_pending`
+  and blocks allocation until corrected.
+- The normal release flow preserves the password when the instance remains
+  reserved for the same application.
 
 ## Task model
 

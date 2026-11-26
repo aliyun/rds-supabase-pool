@@ -22,6 +22,7 @@ import { cx, formatDateTime, MODE_META, relativeTime } from "../lib/format";
 import type {
   AuthInfo,
   EndpointsInfo,
+  InstanceAccess,
   InstanceNetwork,
   PlatformToken,
   PortalInstance,
@@ -55,6 +56,7 @@ export function PortalApp() {
   const [applyMode, setApplyMode] = useState<"single" | "shared">("shared");
   const [applyAppName, setApplyAppName] = useState("");
   const [connectionTarget, setConnectionTarget] = useState<PortalInstance | null>(null);
+  const [accessTarget, setAccessTarget] = useState<PortalInstance | null>(null);
   const [networkTarget, setNetworkTarget] = useState<PortalInstance | null>(null);
   const [releaseTarget, setReleaseTarget] = useState<PortalInstance | null>(null);
   const [tokensOpen, setTokensOpen] = useState(false);
@@ -325,6 +327,16 @@ export function PortalApp() {
                             <Button
                               size="sm"
                               variant="ghost"
+                              icon={<Server size={12} />}
+                              onClick={() => setAccessTarget(instance)}
+                            >
+                              访问信息
+                            </Button>
+                          ) : null}
+                          {instance.status === "InUse" ? (
+                            <Button
+                              size="sm"
+                              variant="ghost"
                               icon={<ShieldCheck size={12} />}
                               onClick={() => setNetworkTarget(instance)}
                             >
@@ -417,6 +429,9 @@ export function PortalApp() {
       />
       {connectionTarget ? (
         <ConnectionModal instance={connectionTarget} onClose={() => setConnectionTarget(null)} />
+      ) : null}
+      {accessTarget ? (
+        <AccessModal instance={accessTarget} onClose={() => setAccessTarget(null)} />
       ) : null}
       {networkTarget ? (
         <NetworkModal instance={networkTarget} onClose={() => setNetworkTarget(null)} />
@@ -1201,6 +1216,125 @@ function ReleaseModal({
           </div>
         ) : null}
       </div>
+    </Modal>
+  );
+}
+
+function AccessModal({ instance, onClose }: { instance: PortalInstance; onClose: () => void }) {
+  const { push } = useToast();
+  const [access, setAccess] = useState<InstanceAccess | null>(null);
+  const [secret, setSecret] = useState<{ username: string; password: string } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [revealing, setRevealing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      try {
+        const data = await api.portalAccess(instance.id);
+        if (!cancelled) setAccess(data);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [instance.id]);
+
+  const copy = async (label: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      push("success", `${label} 已复制`);
+    } catch {
+      push("error", "复制失败，请手动选择文本");
+    }
+  };
+
+  const reveal = async () => {
+    setRevealing(true);
+    try {
+      const data = await api.revealStudio(instance.id);
+      setSecret({ username: data.studio_username, password: data.studio_password });
+    } catch (err) {
+      push("error", err instanceof Error ? err.message : String(err));
+    } finally {
+      setRevealing(false);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Studio / Agent Runtime"
+      subtitle={`${instance.app_name} · ${instance.region_name}`}
+      width="max-w-xl"
+    >
+      {loading ? (
+        <div className="flex justify-center py-12"><Spinner size={22} /></div>
+      ) : error ? (
+        <div className="rounded-lg border border-rose/30 bg-rose/[0.07] px-3 py-2.5 text-[11px] text-rose">{error}</div>
+      ) : (
+        <div className="space-y-4">
+          <div className="flex items-center gap-2 text-[11px] text-slate-400">
+            <ShieldCheck size={14} className="text-acid" />
+            这些入口只对当前实例使用者开放，请勿分享给其他应用。
+          </div>
+
+          <div className="rounded-lg border border-edge bg-white/[0.02] p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-[11px] text-slate-300">Supabase Studio</div>
+                <div className="mt-1 text-[10px] text-slate-500">用户名：{access?.studio_username || "supabase"}</div>
+              </div>
+              <Button size="sm" variant="ghost" icon={<Copy size={12} />} disabled={!access?.studio_url} onClick={() => void copy("Studio 地址", access?.studio_url || "")}>
+                复制地址
+              </Button>
+            </div>
+            <div className="mono mt-2 break-all text-[10px] text-slate-400">{access?.studio_url || "暂不可用"}</div>
+            {access?.studio_available ? (
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <Button size="sm" variant="secondary" loading={revealing} onClick={() => void reveal()}>
+                  显示密码
+                </Button>
+                {secret ? (
+                  <>
+                    <span className="mono text-[11px] text-amber">{secret.password}</span>
+                    <Button size="sm" variant="ghost" icon={<Copy size={12} />} onClick={() => void copy("Studio 密码", secret.password)}>
+                      复制密码
+                    </Button>
+                  </>
+                ) : null}
+              </div>
+            ) : (
+              <div className="mt-2 text-[10px] text-amber">
+                {access?.studio_url ? "Studio 凭据尚未初始化，请联系管理员。" : "当前资源池未开放 Studio 访问。"}
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-lg border border-edge bg-white/[0.02] p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-[11px] text-slate-300">Agent Runtime</div>
+              <Button size="sm" variant="ghost" icon={<Copy size={12} />} disabled={!access?.agent_runtime_available} onClick={() => void copy("Agent Runtime 地址", access?.agent_runtime_url || "")}>
+                复制地址
+              </Button>
+            </div>
+            <div className="mono mt-2 break-all text-[10px] text-slate-400">
+              {access?.agent_runtime_available ? access.agent_runtime_url : "暂不可用"}
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-amber/25 bg-amber/[0.06] px-3 py-2.5 text-[10px] leading-5 text-amber">
+            访问前请确认当前浏览器出口 IP 已在实例白名单中；Studio 和 Agent Runtime 均使用该实例公网地址。
+          </div>
+        </div>
+      )}
     </Modal>
   );
 }
