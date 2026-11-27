@@ -95,6 +95,8 @@ All routes below require an admin session unless noted.
 | POST   | `/instances/prewarm`           | Prewarm one or more instances                                            |
 | POST   | `/instances/backfill-agent-runtime` | Enable Agent Runtime on eligible InCold instances                    |
 | POST   | `/instances/backfill-studio-credentials` | Initialize Studio credentials for eligible InCold instances      |
+| POST   | `/instances/repair-studio-credentials` | Repair unreadable or missing Studio credentials; queue InUse repairs on return |
+| POST   | `/instances/:id/studio-credential/repair` | Repair one instance credential; InUse is queued for return        |
 | GET    | `/instances/:id`               | Instance detail                                                          |
 | DELETE | `/instances/:id`               | Delete an instance and its cloud resources                               |
 | GET    | `/instances/:id/events`        | Instance audit timeline                                                  |
@@ -252,8 +254,16 @@ Pool settings `allow_user_studio` and `allow_user_agent_runtime` default to
 - Existing InCold instances can be initialized with
   `POST /instances/backfill-studio-credentials` (up to 5 per batch).
 - Existing InUse instances are initialized on return if no credential exists.
-- If Studio access is enabled and an InCold instance has no initialized
-  credential, allocation is rejected until the administrator initializes it.
+- Credential metadata exposes `missing`, `pending`, `unreadable` and `ready`.
+  An encrypted credential that cannot be decrypted with the current platform
+  key is reported as `unreadable`, never as ready.
+- `POST /instances/repair-studio-credentials` repairs missing or unreadable
+  InCold credentials and queues InUse instances for repair on return.
+  `POST /instances/:id/studio-credential/repair` handles one instance.
+- If Studio access is enabled, allocation is rejected while an InCold
+  credential is not ready.
+- `repairable` instances are excluded from available-idle counts and suppress
+  automatic prewarming until they are repaired.
 - A failed credential rotation marks the instance as `studio_rotation_pending`
   and blocks allocation until corrected.
 - The normal release flow preserves the password when the instance remains

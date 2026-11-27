@@ -229,15 +229,27 @@ async function requireAdmin(req: Request) {
   return ctx;
 }
 
-function isAvailableIdle(row: any, studioRequired: boolean): boolean {
+function isBaseIdle(row: any): boolean {
   const detail = parseObject(row.detail);
   return row.status === "InCold"
     && !row.owner_user_id
     && detail.reserved !== true
-    && detail.reserved !== "true"
+    && detail.reserved !== "true";
+}
+
+function isAvailableIdle(row: any, studioRequired: boolean): boolean {
+  const detail = parseObject(row.detail);
+  return isBaseIdle(row)
     && detail.studio_rotation_pending !== true
     && detail.studio_rotation_pending !== "true"
-    && (!studioRequired || row.credential_ready === true);
+    && (!studioRequired || row.credential_status === "ready");
+}
+
+function isRepairableIdle(row: any, studioRequired: boolean): boolean {
+  const detail = parseObject(row.detail);
+  return isBaseIdle(row)
+    && studioRequired
+    && (row.credential_status !== "ready" || detail.studio_rotation_pending === true || detail.studio_rotation_pending === "true");
 }
 
 function poolStats(rows: any[], studioRequired = false) {
@@ -254,6 +266,7 @@ function poolStats(rows: any[], studioRequired = false) {
     cold: byStatus.InCold || 0,
     reserved,
     available: rows.filter((row) => isAvailableIdle(row, studioRequired)).length,
+    repairable: rows.filter((row) => isRepairableIdle(row, studioRequired)).length,
     in_use: byStatus.InUse || 0,
     creating: byStatus.Creating || 0,
     failed: byStatus.Failed || 0,
@@ -263,14 +276,14 @@ function poolStats(rows: any[], studioRequired = false) {
 async function regionsPayload() {
   const regions = await sql`select * from regions order by region_id`;
   const pools = await sql`select * from pools order by region_id, mode`;
-  const instances = await sql`
-    select i.pool_id, i.status, i.detail, i.id, i.owner_user_id,
-      exists (
-        select 1 from instance_credentials c
-        where c.instance_id = i.id and c.initialized = true
-      ) as credential_ready
+  const credentialHealth = await studioCredentialHealthMap();
+  const instances = (await sql`
+    select i.pool_id, i.status, i.detail, i.id, i.owner_user_id
     from pool_instances i where i.is_deleted = false
-  `;
+  `).map((inst: any) => ({
+    ...inst,
+    credential_status: credentialHealth.get(inst.id)?.status || "missing",
+  }));
   const shared = await sql`select pg_instance_id, pool_id, name, region_id, status, enabled, reserved_slots, capacity from shared_pgs`;
   return regions.map((region: any) => ({
     ...region,
@@ -532,15 +545,61 @@ async function saveStudioCredential(
   `;
 }
 
-async function readStudioCredential(instanceId: string) {
+type StudioCredentialHealth = {
+  status: "missing" | "pending" | "unreadable" | "ready";
+  username: string;
+  password?: string;
+  error?: string;
+};
+
+async function studioCredentialHealthFromRow(row: any): Promise<StudioCredentialHealth> {
+  if (!row) return { status: "missing", username: STUDIO_USERNAME };
+  const username = row.studio_username || STUDIO_USERNAME;
+  try {
+    const password = await decryptStudioPassword(String(row.studio_password_enc || ""));
+    return {
+      status: row.initialized ? "ready" : "pending",
+      username,
+      password,
+    };
+  } catch {
+    return {
+      status: row.initialized ? "unreadable" : "pending",
+      username,
+      error: row.initialized ? "Studio credential cannot be decrypted" : "",
+    };
+  }
+}
+
+async function studioCredentialHealth(instanceId: string): Promise<StudioCredentialHealth> {
   const rows = await sql`select * from instance_credentials where instance_id = ${instanceId} limit 1`;
-  const row: any = rows[0];
-  if (!row) return null;
+  return studioCredentialHealthFromRow(rows[0]);
+}
+
+async function studioCredentialHealthMap(db: any = sql): Promise<Map<string, StudioCredentialHealth>> {
+  const rows = await db`select * from instance_credentials`;
+  const pairs = await Promise.all(
+    rows.map(async (row: any) => [row.instance_id, await studioCredentialHealthFromRow(row)] as const),
+  );
+  return new Map(pairs);
+}
+
+async function markStudioCredentialReady(instanceId: string, actor: string) {
+  await sql`
+    update instance_credentials
+    set initialized = true, updated_at = now(), updated_by = ${actor}
+    where instance_id = ${instanceId}
+  `;
+}
+
+async function readStudioCredential(instanceId: string) {
+  const health = await studioCredentialHealth(instanceId);
+  if (health.status !== "ready" || !health.password) return null;
   return {
-    instance_id: row.instance_id,
-    username: row.studio_username || STUDIO_USERNAME,
-    password: await decryptStudioPassword(String(row.studio_password_enc || "")),
-    initialized: !!row.initialized,
+    instance_id: instanceId,
+    username: health.username,
+    password: health.password,
+    initialized: true,
   };
 }
 
@@ -548,7 +607,6 @@ async function rotateStudioCredential(inst: any, adapter: any, actor: string): P
   const password = randomStudioPassword();
   await saveStudioCredential(inst.id, password, false, actor);
   await adapter.resetStudioPassword(inst.supabase_instance_id, password);
-  await saveStudioCredential(inst.id, password, true, actor);
   return password;
 }
 
@@ -728,19 +786,14 @@ function agentRuntimeEnabled(components: unknown): boolean {
   });
 }
 
-async function studioCredentialInitialized(instanceId: string): Promise<boolean> {
-  const rows = await sql`select initialized from instance_credentials where instance_id = ${instanceId} limit 1`;
-  return !!rows[0]?.initialized;
-}
-
 async function studioAllocationGuard(inst: any, pool: any): Promise<string> {
   const config = poolConfig(pool?.config);
   if (config.allow_user_studio === false) return "";
   const detail = parseObject(inst.detail);
   if (detail.studio_rotation_pending === true) return "Studio 凭据轮换尚未完成，暂不可分配";
-  if (!(await studioCredentialInitialized(inst.id))) {
-    return "该实例尚未初始化 Studio 凭据，请管理员先执行初始化";
-  }
+  const health = await studioCredentialHealth(inst.id);
+  if (health.status === "unreadable") return "Studio 凭据无法解密，请管理员先修复";
+  if (health.status !== "ready") return "该实例 Studio 凭据尚未就绪，请管理员先初始化或修复";
   return "";
 }
 
@@ -750,6 +803,8 @@ async function studioAccessPayload(adapter: any, inst: any, config: Record<strin
       studio_url: "",
       studio_username: STUDIO_USERNAME,
       studio_available: false,
+      studio_credential_status: "missing",
+      studio_error: "实例尚未创建 Supabase 资源",
       agent_runtime_url: "",
       agent_runtime_available: false,
     };
@@ -777,11 +832,14 @@ async function studioAccessPayload(adapter: any, inst: any, config: Record<strin
   }
   const studioEnabled = config.allow_user_studio !== false;
   const agentRuntimeAllowed = config.allow_user_agent_runtime !== false;
-  const credentialReady = base && studioEnabled ? await studioCredentialInitialized(inst.id) : false;
+  const credential = base && studioEnabled ? await studioCredentialHealth(inst.id) : null;
+  const credentialReady = credential?.status === "ready";
   return {
     studio_url: base && studioEnabled ? `${base}/` : "",
-    studio_username: STUDIO_USERNAME,
+    studio_username: credential?.username || STUDIO_USERNAME,
     studio_available: !!base && studioEnabled && credentialReady,
+    studio_credential_status: credential?.status || "missing",
+    studio_error: credential?.error || "",
     agent_runtime_url: base && agentRuntimeAllowed ? `${base}/agent-runtime` : "",
     agent_runtime_available: !!base && agentRuntimeAllowed && runtimeReady,
   };
@@ -1540,8 +1598,8 @@ async function ensureWorkerSchema() {
   if (workerSchemaReady) return;
   await sql`alter table tasks add column if not exists step varchar(48) default 'prepare'`;
   await sql`alter table tasks add column if not exists attempts integer default 0`;
-  await sql`alter table tasks add column if not exists next_run_at timestamp`;
-  await sql`alter table tasks add column if not exists locked_at timestamp`;
+  await sql`alter table tasks add column if not exists next_run_at timestamptz`;
+  await sql`alter table tasks add column if not exists locked_at timestamptz`;
   workerSchemaReady = true;
 }
 
@@ -1656,7 +1714,7 @@ const BASE_SCHEMA_STATEMENTS = [
       enabled boolean not null default true,
       portal_enabled boolean not null default true,
       portal_pool_mode varchar(16) not null default 'shared',
-      created_at timestamp not null default now()
+      created_at timestamptz not null default now()
     )`,
     `create table if not exists pools (
       id varchar(40) primary key,
@@ -1668,8 +1726,8 @@ const BASE_SCHEMA_STATEMENTS = [
       vswitch_id varchar(80),
       zone_id varchar(80),
       config json not null default '{}'::json,
-      created_at timestamp not null default now(),
-      updated_at timestamp not null default now(),
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
       constraint uq_pool_region_mode unique (region_id, mode)
     )`,
     `create index if not exists ix_pools_region_id on pools (region_id)`,
@@ -1691,9 +1749,9 @@ const BASE_SCHEMA_STATEMENTS = [
       reserved_slots integer not null default 0,
       capacity json not null default '{}'::json,
       tags json not null default '[]'::json,
-      added_at timestamp not null default now(),
-      updated_at timestamp not null default now(),
-      last_checked_at timestamp
+      added_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      last_checked_at timestamptz
     )`,
     `create table if not exists pool_instances (
       id varchar(40) primary key,
@@ -1717,10 +1775,10 @@ const BASE_SCHEMA_STATEMENTS = [
       error text,
       detail json not null default '{}'::json,
       is_deleted boolean not null default false,
-      created_at timestamp not null default now(),
-      updated_at timestamp not null default now(),
-      last_checked_at timestamp,
-      deleted_at timestamp
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      last_checked_at timestamptz,
+      deleted_at timestamptz
     )`,
     `create index if not exists ix_pool_instances_mode on pool_instances (mode)`,
     `create index if not exists ix_pool_instances_status on pool_instances (status)`,
@@ -1742,13 +1800,13 @@ const BASE_SCHEMA_STATEMENTS = [
       payload json not null default '{}'::json,
       result json not null default '{}'::json,
       error text,
-      created_at timestamp not null default now(),
-      started_at timestamp,
-      finished_at timestamp,
+      created_at timestamptz not null default now(),
+      started_at timestamptz,
+      finished_at timestamptz,
       step varchar(48) default 'prepare',
       attempts integer default 0,
-      next_run_at timestamp,
-      locked_at timestamp
+      next_run_at timestamptz,
+      locked_at timestamptz
     )`,
     `create index if not exists ix_tasks_kind on tasks (kind)`,
     `create index if not exists ix_tasks_status on tasks (status)`,
@@ -1762,9 +1820,9 @@ const BASE_SCHEMA_STATEMENTS = [
       role varchar(16) not null default 'user',
       enabled boolean not null default true,
       token_version integer not null default 0,
-      created_at timestamp not null default now(),
-      updated_at timestamp not null default now(),
-      last_login_at timestamp
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      last_login_at timestamptz
     )`,
     `create unique index if not exists ix_platform_users_username on platform_users (username)`,
     `create table if not exists platform_tokens (
@@ -1774,10 +1832,10 @@ const BASE_SCHEMA_STATEMENTS = [
       prefix varchar(24) not null unique,
       token_hash varchar(64) not null unique,
       scopes json not null default '[]'::json,
-      expires_at timestamp,
-      revoked_at timestamp,
-      last_used_at timestamp,
-      created_at timestamp not null default now()
+      expires_at timestamptz,
+      revoked_at timestamptz,
+      last_used_at timestamptz,
+      created_at timestamptz not null default now()
     )`,
     `create index if not exists ix_platform_tokens_user_id on platform_tokens (user_id)`,
     `create table if not exists audit_events (
@@ -1786,7 +1844,7 @@ const BASE_SCHEMA_STATEMENTS = [
       action varchar(80) not null,
       message text not null default '',
       detail json not null default '{}'::json,
-      created_at timestamp not null default now()
+      created_at timestamptz not null default now()
     )`,
     `create index if not exists ix_audit_events_instance_id on audit_events (instance_id)`,
     `create table if not exists api_call_logs (
@@ -1800,12 +1858,12 @@ const BASE_SCHEMA_STATEMENTS = [
       error_message text,
       duration_ms integer not null default 0,
       params json not null default '{}'::json,
-      created_at timestamp not null default now()
+      created_at timestamptz not null default now()
     )`,
     `create table if not exists platform_config (
       key varchar(80) primary key,
       value json not null default '{}'::json,
-      updated_at timestamp not null default now()
+      updated_at timestamptz not null default now()
     )`,
     `create table if not exists instance_credentials (
       instance_id varchar(40) primary key,
@@ -1813,13 +1871,40 @@ const BASE_SCHEMA_STATEMENTS = [
       studio_password_enc text not null,
       initialized boolean not null default false,
       key_version integer not null default 1,
-      updated_at timestamp not null default now(),
+      updated_at timestamptz not null default now(),
       updated_by varchar(160) not null default ''
     )`,
 ];
 
 let baseSchemaReady = false;
 const BASE_TABLE_NAMES = ["pool_instances", "tasks", "platform_users", "platform_tokens", "shared_pgs", "regions", "pools", "audit_events", "api_call_logs", "platform_config"];
+
+const TIMESTAMP_TABLES = new Set([
+  "regions", "pools", "shared_pgs", "pool_instances", "tasks", "platform_users",
+  "platform_tokens", "audit_events", "api_call_logs", "platform_config",
+  "instance_credentials", "setup_jobs", "pool_control_config",
+]);
+
+async function ensureTimestamptzColumns(db: any, tables: string[] = [...TIMESTAMP_TABLES]) {
+  const allowed = new Set(tables);
+  const rows = await db`
+    select table_name, column_name
+    from information_schema.columns
+    where table_schema = 'public'
+      and data_type = 'timestamp without time zone'
+  `;
+  for (const row of rows) {
+    const table = String(row.table_name);
+    const column = String(row.column_name);
+    if (!allowed.has(table)) continue;
+    const quotedTable = `"${table.replace(/"/g, '""')}"`;
+    const quotedColumn = `"${column.replace(/"/g, '""')}"`;
+    await db.unsafe(
+      `alter table public.${quotedTable} alter column ${quotedColumn} type timestamptz ` +
+      `using ${quotedColumn} at time zone current_setting('TimeZone')`,
+    );
+  }
+}
 
 // Older writes stored detail as a JSON string; normalize before SQL reads nested fields.
 async function normalizeInstanceDetailEncoding() {
@@ -1843,7 +1928,7 @@ async function ensureInstanceCredentialsTable() {
     studio_password_enc text not null,
     initialized boolean not null default false,
     key_version integer not null default 1,
-    updated_at timestamp not null default now(),
+    updated_at timestamptz not null default now(),
     updated_by varchar(160) not null default ''
   )`;
 }
@@ -1868,6 +1953,7 @@ async function ensureBaseSchema() {
     await normalizeInstanceDetailEncoding();
     await ensurePgTagColumns();
     await ensureInstanceCredentialsTable();
+    await ensureTimestamptzColumns(sql);
     baseSchemaReady = true;
     return;
   }
@@ -1877,6 +1963,7 @@ async function ensureBaseSchema() {
   await normalizeInstanceDetailEncoding();
   await ensurePgTagColumns();
   await ensureInstanceCredentialsTable();
+  await ensureTimestamptzColumns(sql);
   baseSchemaReady = true;
 }
 
@@ -1903,6 +1990,11 @@ async function configSet(key: string, value: any) {
 
 async function configDelete(key: string) {
   await sql`delete from platform_config where key = ${key}`;
+}
+
+async function currentBillingMonth(): Promise<string> {
+  const rows = await sql`select to_char(now(), 'YYYY-MM') as month`;
+  return String(rows[0]?.month || new Date().toISOString().slice(0, 7));
 }
 
 function maskCredential(value: string) {
@@ -1957,7 +2049,8 @@ async function resolveControlDb(force = false) {
   controlDbCheckedAt = Date.now();
   const admin = await adminDb();
   try {
-    await admin`create table if not exists pool_control_config (key text primary key, value text not null, updated_at timestamp not null default now())`;
+    await admin`create table if not exists pool_control_config (key text primary key, value text not null, updated_at timestamptz not null default now())`;
+    await ensureTimestamptzColumns(admin, ["pool_control_config"]);
     const rows = await admin`select value from pool_control_config where key = 'control_db_url' limit 1`;
     let target = rows[0]?.value || "";
     if (target) {
@@ -2030,7 +2123,8 @@ async function initControlPlane(force = false) {
 async function setControlDbPointer(targetUrl: string) {
   const admin = await adminDb();
   try {
-    await admin`create table if not exists pool_control_config (key text primary key, value text not null, updated_at timestamp not null default now())`;
+    await admin`create table if not exists pool_control_config (key text primary key, value text not null, updated_at timestamptz not null default now())`;
+    await ensureTimestamptzColumns(admin, ["pool_control_config"]);
     const encrypted = await encryptConfig(targetUrl);
     await admin`
       insert into pool_control_config (key, value, updated_at) values ('control_db_url', ${encrypted}, now())
@@ -2514,7 +2608,7 @@ async function preflightPayload() {
         checks.push({ name: "RDS AI Supabase 读取", status: "warn", message: String(err), detail: {} });
       }
       try {
-        const month = new Date().toISOString().slice(0, 7);
+        const month = await currentBillingMonth();
         await adapter.rpc("business.aliyuncs.com", "DescribeInstanceBill", "2017-12-14", { BillingCycle: month, Granularity: "MONTHLY", MaxResults: 1 });
         checks.push({ name: "账单权限", status: "pass", message: "BSS 实例账单接口可用", detail: {} });
       } catch (err) {
@@ -2629,6 +2723,7 @@ async function overviewPayload(requestedRegionId = "") {
           cold: 0,
           reserved: 0,
           available: 0,
+          repairable: 0,
           in_use: 0,
           creating: 0,
           failed: 0,
@@ -2783,11 +2878,12 @@ async function processPrewarm(task: any, inst: any) {
   if (step === "create_supabase") {
     let supabaseId = inst.supabase_instance_id;
     if (!supabaseId) {
-      let credential = await readStudioCredential(inst.id);
-      if (!credential || !credential.initialized) {
-        const password = credential?.password || randomStudioPassword();
-        await saveStudioCredential(inst.id, password, true, "prewarm");
-        credential = { instance_id: inst.id, username: STUDIO_USERNAME, password, initialized: true };
+      const credential = await studioCredentialHealth(inst.id);
+      const password = credential.status === "ready" && credential.password
+        ? credential.password
+        : credential.password || randomStudioPassword();
+      if (credential.status !== "ready") {
+        await saveStudioCredential(inst.id, password, false, "prewarm");
       }
       const vswitch = inst.mode === "shared" ? inst.vswitch_id : pool.vswitch_id;
       supabaseId = await adapter.createSupabase({
@@ -2797,10 +2893,11 @@ async function processPrewarm(task: any, inst: any) {
         app_name: `pool-${inst.id.slice(0, 8)}`,
         instance_class: inst.mode === "shared" ? "rdsai.supabase.share.basic" : "rdsai.supabase.basic",
         dashboard_username: STUDIO_USERNAME,
-        dashboard_password: credential.password,
+        dashboard_password: password,
         database_password: Deno.env.get("SUPABASE_DATABASE_PASSWORD") || randomToken(18),
         public_endpoint_enabled: config.public_endpoint_enabled !== false,
       });
+      await saveStudioCredential(inst.id, password, true, "prewarm");
       await setInstance(inst.id, { supabase_instance_id: supabaseId });
     }
     return scheduleTask(task, "wait_supabase", 55, "等待 Supabase 就绪", 5);
@@ -3135,8 +3232,10 @@ async function releaseContinue(
   progress: number,
   message = "停止实例",
 ) {
-  if (config.allow_user_studio !== false && !(await studioCredentialInitialized(inst.id))) {
-    return scheduleTask(task, "studio_credentials", progress, "初始化 Studio 凭据", 1);
+  const detail = parseObject(inst.detail);
+  const repairOnReturn = detail.studio_repair_on_return === true;
+  if (config.allow_user_studio !== false && (repairOnReturn || (await studioCredentialHealth(inst.id)).status !== "ready")) {
+    return scheduleTask(task, "studio_credentials", progress, "修复或初始化 Studio 凭据", 1);
   }
   return scheduleTask(task, "stop_supabase", progress, message, 1);
 }
@@ -3253,7 +3352,7 @@ async function processRelease(task: any, inst: any) {
     return scheduleTask(task, "wait_agent_runtime", 55, `等待 Agent Runtime 就绪（${data.status}）`, 10);
   }
   if (step === "studio_credentials") {
-    if (await studioCredentialInitialized(inst.id)) {
+    if ((await studioCredentialHealth(inst.id)).status === "ready" && detail.studio_repair_on_return !== true) {
       return await releaseContinue(task, inst, releasePoolConfig, 65);
     }
     try {
@@ -3285,10 +3384,12 @@ async function processRelease(task: any, inst: any) {
       return scheduleTask(task, "wait_studio_credentials", 68, "等待实例重新启动", 8);
     }
     if (data.status === "Running") {
+      await markStudioCredentialReady(inst.id, "release");
       await saveInstanceDetail(inst, {
         ...parseObject(inst.detail),
         cloud: data,
         studio_rotation_pending: false,
+        studio_repair_on_return: false,
         studio_error: "",
       }, { error: null });
       return scheduleTask(task, "stop_supabase", 72, "停止实例", 1);
@@ -3552,6 +3653,7 @@ async function processStudioCredentialBackfill(task: any, inst: any) {
       return scheduleTask(task, "wait_reset", 60, `等待实例重启完成（${data.status}）`, 8);
     }
     try {
+      await markStudioCredentialReady(inst.id, payload.actor || "admin_studio_backfill");
       await applyClosedNetwork(inst, adapter, "admin_studio_backfill");
       return scheduleTask(task, "stop", 75, "停止实例", 1);
     } catch (err) {
@@ -3589,6 +3691,7 @@ async function processStudioCredentialBackfill(task: any, inst: any) {
     await saveInstanceDetail(inst, {
       ...parseObject(inst.detail),
       studio_rotation_pending: false,
+      studio_repair_on_return: false,
       studio_error: "",
     }, { status: "InCold", cloud_status: "Stopped", error: null });
     await finishTask(task, { instance_id: inst.id, status: "InCold" });
@@ -3640,6 +3743,7 @@ function sharedPgView(row: any) {
     weight: Number(row.weight || 1),
     reserved_slots: Number(row.reserved_slots || 0),
     tenant_count: Number(row.tenant_count || 0),
+    in_use_count: Number(row.in_use_count || 0),
     capacity: parseObject(row.capacity),
     tags: safePgTags(row.tags),
     last_checked_at: row.last_checked_at,
@@ -3654,12 +3758,21 @@ async function sharedPgRows(poolId?: string, regionId?: string) {
       ? await sql`select * from shared_pgs where region_id = ${regionId} order by added_at asc`
       : await sql`select * from shared_pgs order by added_at asc`;
   const counts = await sql`
-    select pg_instance_id, count(*)::int as total from pool_instances
-    where is_deleted = false and status != 'Failed' and pg_instance_id is not null
+    select pg_instance_id,
+      count(*) filter (where status != 'Failed')::int as total,
+      count(*) filter (where status = 'InUse')::int as in_use
+    from pool_instances
+    where is_deleted = false and pg_instance_id is not null
     group by pg_instance_id
   `;
-  const byId = new Map(counts.map((item: any) => [item.pg_instance_id, Number(item.total)]));
-  return rows.map((row: any) => sharedPgView({ ...row, tenant_count: byId.get(row.pg_instance_id) || 0 }));
+  const byId = new Map(counts.map((item: any) => [item.pg_instance_id, {
+    tenant_count: Number(item.total || 0),
+    in_use_count: Number(item.in_use || 0),
+  }]));
+  return rows.map((row: any) => {
+    const countsForPg = byId.get(row.pg_instance_id) || { tenant_count: 0, in_use_count: 0 };
+    return sharedPgView({ ...row, ...countsForPg });
+  });
 }
 
 function normalizeCapacityPayload(value: any, fallbackName = "") {
@@ -3683,13 +3796,16 @@ function normalizeCapacityPayload(value: any, fallbackName = "") {
 function aggregateCapacity(rows: any[]) {
   if (!rows.length) return {};
   const sum = (key: string) => rows.reduce((total, row) => total + Number(row.capacity?.[key] || 0), 0);
+  const count = (key: string) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
   return {
     db_instance_name: `${rows.length} 个共享 PG`,
     active_ratio: rows.reduce((total, row) => total + Number(row.capacity?.active_ratio || 0), 0) / rows.length,
     estimated_max_active_tenants: sum("estimated_max_active_tenants"),
     estimated_max_total_tenants: sum("estimated_max_total_tenants"),
-    current_active_tenants: rows.reduce((total, row) => total + Number(row.tenant_count || 0), 0),
-    current_total_tenants: rows.reduce((total, row) => total + Number(row.tenant_count || 0), 0),
+    current_active_tenants: sum("current_active_tenants"),
+    current_total_tenants: sum("current_total_tenants"),
+    tenant_count: count("tenant_count"),
+    in_use_count: count("in_use_count"),
     shared_pg_count: rows.length,
   };
 }
@@ -3832,20 +3948,20 @@ async function processAction(task: any, inst: any) {
   await finishTask(task, { instance_id: inst.id, action });
 }
 
-async function enqueuePrewarm(pool: any, count: number): Promise<string[]> {
+async function enqueuePrewarm(pool: any, count: number, db: any = sql): Promise<string[]> {
   const taskIds: string[] = [];
   for (let index = 0; index < count; index += 1) {
     const instanceId = randomId();
     const appName = `pool-${pool.mode}-${randomToken(4)}`;
     const detail = { source: "edge-auto-prewarm", cloud_mode: CLOUD_MODE, pool_id: pool.id, network: initialNetworkState() };
-    await sql`
+    await db`
       insert into pool_instances (id, mode, pool_id, status, app_name, region_id, vpc_id, vswitch_id, instance_class, detail, is_deleted, created_at, updated_at)
       values (${instanceId}, ${pool.mode}, ${pool.id}, 'Creating', ${appName}, ${pool.region_id}, ${pool.vpc_id}, ${pool.vswitch_id},
               ${pool.mode === "shared" ? "rdsai.supabase.share.basic" : "rdsai.supabase.basic"},
               ${detail}::json, false, now(), now())
     `;
     const taskId = randomId();
-    await sql`
+    await db`
       insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
       values (${taskId}, 'prewarm', ${pool.mode}, ${pool.id}, ${instanceId}, ${`预热 ${appName}`}, 'pending', 0, '等待 worker',
               ${JSON.stringify({ instance_id: instanceId, cloud_mode: CLOUD_MODE, pool_id: pool.id })}::json, '{}'::json, 'prepare', 0, now())
@@ -3855,8 +3971,22 @@ async function enqueuePrewarm(pool: any, count: number): Promise<string[]> {
   return taskIds;
 }
 
-async function sharedPoolCapacityHeadroom(poolId: string, total: number): Promise<number> {
-  const rows = await sql`
+async function withPoolLock<T>(poolId: string, fn: (db: any) => Promise<T>): Promise<T> {
+  return await sql.begin(async (tx: any) => {
+    await tx`select pg_advisory_xact_lock(hashtextextended(${`pool:${poolId}`}, 0))`;
+    return await fn(tx);
+  });
+}
+
+async function withAppLock<T>(userId: string, appName: string, fn: (db: any) => Promise<T>): Promise<T> {
+  return await sql.begin(async (tx: any) => {
+    await tx`select pg_advisory_xact_lock(hashtextextended(${`app:${userId}:${appName}`}, 0))`;
+    return await fn(tx);
+  });
+}
+
+async function sharedPoolCapacityHeadroom(poolId: string, total: number, db: any = sql): Promise<number> {
+  const rows = await db`
     select capacity from shared_pgs
     where pool_id = ${poolId} and enabled = true and status = 'Running'
   `;
@@ -3877,33 +4007,40 @@ async function sharedPoolCapacityHeadroom(poolId: string, total: number): Promis
 async function maybeAutoRefill() {
   const rows = await sql`select * from pools where enabled = true`;
   for (const row of rows) {
-    const config = poolConfig(row.config);
-    if (!config.auto_refill) continue;
-    const pending = await sql`select count(*)::int as total from tasks where pool_id = ${row.id} and kind = 'prewarm' and status in ('pending','running')`;
-    if (Number(pending[0].total) > 0) continue;
-    if (row.mode === "shared") {
-      const shared = await sql`select count(*)::int as total from shared_pgs where pool_id = ${row.id} and enabled = true and status = 'Running'`;
-      if (Number(shared[0].total) === 0) continue;
-    }
-    const instances = await sql`
-      select i.id, i.status, i.owner_user_id, i.detail,
-        exists (
-          select 1 from instance_credentials c
-          where c.instance_id = i.id and c.initialized = true
-        ) as credential_ready
-      from pool_instances i
-      where i.pool_id = ${row.id} and i.is_deleted = false
-    `;
-    const studioRequired = config.allow_user_studio !== false;
-    const total = instances.length;
-    const available = instances.filter((inst: any) => isAvailableIdle(inst, studioRequired)).length;
-    const target = Math.max(0, Number(config.target ?? 2));
-    const maximum = Math.max(0, Number(config.max ?? 4));
-    let remaining = Math.min(Math.max(0, target - available), Math.max(0, maximum - total));
-    if (row.mode === "shared" && remaining > 0) {
-      remaining = Math.min(remaining, await sharedPoolCapacityHeadroom(row.id, total));
-    }
-    if (remaining > 0) await enqueuePrewarm(row, Math.min(remaining, 2));
+    await withPoolLock(row.id, async (tx: any) => {
+      const currentRows = await tx`select * from pools where id = ${row.id} and enabled = true limit 1`;
+      const pool: any = currentRows[0];
+      if (!pool) return;
+      const config = poolConfig(pool.config);
+      if (!config.auto_refill) return;
+      const pending = await tx`select count(*)::int as total from tasks where pool_id = ${pool.id} and kind in ('prewarm','studio_credentials') and status in ('pending','running')`;
+      if (Number(pending[0].total) > 0) return;
+      if (pool.mode === "shared") {
+        const shared = await tx`select count(*)::int as total from shared_pgs where pool_id = ${pool.id} and enabled = true and status = 'Running'`;
+        if (Number(shared[0].total) === 0) return;
+      }
+      const credentialHealth = await studioCredentialHealthMap(tx);
+      const instances = (await tx`
+        select i.id, i.status, i.owner_user_id, i.detail
+        from pool_instances i
+        where i.pool_id = ${pool.id} and i.is_deleted = false
+      `).map((inst: any) => ({
+        ...inst,
+        credential_status: credentialHealth.get(inst.id)?.status || "missing",
+      }));
+      const studioRequired = config.allow_user_studio !== false;
+      const total = instances.length;
+      const available = instances.filter((inst: any) => isAvailableIdle(inst, studioRequired)).length;
+      const repairable = instances.filter((inst: any) => isRepairableIdle(inst, studioRequired)).length;
+      if (repairable > 0) return;
+      const target = Math.max(0, Number(config.target ?? 2));
+      const maximum = Math.max(0, Number(config.max ?? 4));
+      let remaining = Math.min(Math.max(0, target - available), Math.max(0, maximum - total));
+      if (pool.mode === "shared" && remaining > 0) {
+        remaining = Math.min(remaining, await sharedPoolCapacityHeadroom(pool.id, total, tx));
+      }
+      if (remaining > 0) await enqueuePrewarm(pool, Math.min(remaining, 2), tx);
+    });
   }
 }
 
@@ -3949,13 +4086,14 @@ async function ensureSetupJobTable(admin: any) {
       payload json not null default '{}'::json,
       step varchar(40) not null default 'create_pg',
       attempts integer not null default 0,
-      next_run_at timestamp,
-      locked_at timestamp,
-      created_at timestamp not null default now(),
-      updated_at timestamp not null default now(),
-      finished_at timestamp
+      next_run_at timestamptz,
+      locked_at timestamptz,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      finished_at timestamptz
     )
   `;
+  await ensureTimestamptzColumns(admin, ["setup_jobs"]);
 }
 
 function setupJobPayload(row: any) {
@@ -4832,40 +4970,45 @@ async function handler(req: Request): Promise<Response> {
         pool = rows[0];
       }
       if (!pool) return error("资源池不存在");
-      const regionRows = await sql`select * from regions where region_id = ${pool.region_id} limit 1`;
-      if (regionRows[0] && !regionRows[0].enabled) return error("该地域已停用，不能预热");
-      if (!pool.enabled) return error("资源池已停用，不能预热");
-      if (pool.mode === "shared") {
-        const shared = await sql`select count(*)::int as total from shared_pgs where pool_id = ${pool.id} and enabled = true and status = 'Running'`;
-        if (Number(shared[0].total) === 0) return error("该共享池没有可用的共享 PG，请先添加共享 PG");
-      } else if (!pool.vswitch_id) {
-        return error("该单租池未配置 VSwitch");
-      }
-      const config = poolConfig(pool.config);
-      const totalRows = await sql`select count(*)::int as total from pool_instances where pool_id = ${pool.id} and is_deleted = false`;
-      const remaining = Number(config.max) - Number(totalRows[0].total);
-      if (remaining <= 0) return error(`${pool.name || pool.mode} 已达到最大实例数 ${config.max}`);
-      const count = Math.max(1, Math.min(10, Number(body.count || 1), remaining));
-      const taskIds: string[] = [];
-      for (let index = 0; index < count; index += 1) {
-        const instanceId = randomId();
-        const appName = `pool-${pool.mode}-${randomToken(4)}`;
-        const detail = { source: "edge-prewarm", cloud_mode: CLOUD_MODE, pool_id: pool.id, network: initialNetworkState() };
-        await sql`
-          insert into pool_instances (id, mode, pool_id, status, app_name, region_id, vpc_id, vswitch_id, instance_class, detail, is_deleted, created_at, updated_at)
-          values (${instanceId}, ${pool.mode}, ${pool.id}, 'Creating', ${appName}, ${pool.region_id}, ${pool.vpc_id}, ${pool.vswitch_id},
-                  ${pool.mode === "shared" ? "rdsai.supabase.share.basic" : "rdsai.supabase.basic"},
-                  ${detail}::json, false, now(), now())
-        `;
-        const taskId = randomId();
-        await sql`
-          insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
-          values (${taskId}, 'prewarm', ${pool.mode}, ${pool.id}, ${instanceId}, ${`预热 ${appName}`}, 'pending', 0, '等待 worker',
-                  ${JSON.stringify({ instance_id: instanceId, cloud_mode: CLOUD_MODE, pool_id: pool.id })}::json, '{}'::json, 'prepare', 0, now())
-        `;
-        taskIds.push(taskId);
-      }
-      return json({ task_ids: taskIds, count: taskIds.length, pool_id: pool.id });
+      return await withPoolLock(pool.id, async (tx: any) => {
+        const currentRows = await tx`select * from pools where id = ${pool.id} limit 1`;
+        const current: any = currentRows[0];
+        if (!current) return error("资源池不存在");
+        const regionRows = await tx`select * from regions where region_id = ${current.region_id} limit 1`;
+        if (regionRows[0] && !regionRows[0].enabled) return error("该地域已停用，不能预热");
+        if (!current.enabled) return error("资源池已停用，不能预热");
+        if (current.mode === "shared") {
+          const shared = await tx`select count(*)::int as total from shared_pgs where pool_id = ${current.id} and enabled = true and status = 'Running'`;
+          if (Number(shared[0].total) === 0) return error("该共享池没有可用的共享 PG，请先添加共享 PG");
+        } else if (!current.vswitch_id) {
+          return error("该单租池未配置 VSwitch");
+        }
+        const config = poolConfig(current.config);
+        const totalRows = await tx`select count(*)::int as total from pool_instances where pool_id = ${current.id} and is_deleted = false`;
+        const remaining = Number(config.max) - Number(totalRows[0].total);
+        if (remaining <= 0) return error(`${current.name || current.mode} 已达到最大实例数 ${config.max}`);
+        const count = Math.max(1, Math.min(10, Number(body.count || 1), remaining));
+        const taskIds: string[] = [];
+        for (let index = 0; index < count; index += 1) {
+          const instanceId = randomId();
+          const appName = `pool-${current.mode}-${randomToken(4)}`;
+          const detail = { source: "edge-prewarm", cloud_mode: CLOUD_MODE, pool_id: current.id, network: initialNetworkState() };
+          await tx`
+            insert into pool_instances (id, mode, pool_id, status, app_name, region_id, vpc_id, vswitch_id, instance_class, detail, is_deleted, created_at, updated_at)
+            values (${instanceId}, ${current.mode}, ${current.id}, 'Creating', ${appName}, ${current.region_id}, ${current.vpc_id}, ${current.vswitch_id},
+                    ${current.mode === "shared" ? "rdsai.supabase.share.basic" : "rdsai.supabase.basic"},
+                    ${detail}::json, false, now(), now())
+          `;
+          const taskId = randomId();
+          await tx`
+            insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
+            values (${taskId}, 'prewarm', ${current.mode}, ${current.id}, ${instanceId}, ${`预热 ${appName}`}, 'pending', 0, '等待 worker',
+                    ${JSON.stringify({ instance_id: instanceId, cloud_mode: CLOUD_MODE, pool_id: current.id })}::json, '{}'::json, 'prepare', 0, now())
+          `;
+          taskIds.push(taskId);
+        }
+        return json({ task_ids: taskIds, count: taskIds.length, pool_id: current.id });
+      });
     }
 
     if (path === "/api/instances/backfill-agent-runtime" && method === "POST") {
@@ -4951,6 +5094,105 @@ async function handler(req: Request): Promise<Response> {
       return json({ task_ids: taskIds, count: taskIds.length });
     }
 
+    if (path === "/api/instances/repair-studio-credentials" && method === "POST") {
+      if (!(await requireAdmin(req))) return error("需要管理员权限", 403);
+      const body = await req.json();
+      const force = body.force === true;
+      const limit = Math.max(1, Math.min(20, Number(body.limit || 10)));
+      const conditions = [
+        "is_deleted = false",
+        "supabase_instance_id is not null",
+        "status in ('InCold', 'InUse')",
+      ];
+      const params: any[] = [];
+      if (body.pool_id) {
+        params.push(String(body.pool_id));
+        conditions.push(`pool_id = $${params.length}`);
+      }
+      if (body.region_id) {
+        params.push(String(body.region_id));
+        conditions.push(`region_id = $${params.length}`);
+      }
+      const rows = await sql.unsafe(
+        `select * from pool_instances where ${conditions.join(" and ")} order by created_at asc limit 300`,
+        params,
+      );
+      const health = await studioCredentialHealthMap();
+      const busy = new Set(
+        (await sql`select target_id from tasks where kind = 'studio_credentials' and status in ('pending', 'running')`)
+          .map((task: any) => task.target_id),
+      );
+      const enabledPools = new Set(
+        (await sql`select id, config from pools`)
+          .filter((pool: any) => poolConfig(pool.config).allow_user_studio !== false)
+          .map((pool: any) => pool.id),
+      );
+      const taskIds: string[] = [];
+      let queued = 0;
+      for (const inst of rows) {
+        if (!enabledPools.has(inst.pool_id) || busy.has(inst.id)) continue;
+        const state = health.get(inst.id);
+        if (!force && state?.status === "ready") continue;
+        if (taskIds.length >= limit) break;
+        if (inst.status === "InUse") {
+          const detail = { ...parseObject(inst.detail), studio_repair_on_return: true };
+          await setInstance(inst.id, { detail: JSON.stringify(detail) });
+          await writeAuditEvent(inst.id, "studio_credentials_repair_queued", "登记归还时修复 Studio 凭据", {});
+          queued += 1;
+          continue;
+        }
+        const taskId = randomId();
+        const cloudMode = parseObject(inst.detail).cloud_mode || CLOUD_MODE;
+        await sql`
+          insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
+          values (${taskId}, 'studio_credentials', ${inst.mode}, ${inst.pool_id}, ${inst.id}, ${`修复 Studio 凭据 ${inst.app_name}`}, 'pending', 0, '等待 worker',
+                  ${JSON.stringify({ instance_id: inst.id, cloud_mode: cloudMode, source: "repair", force: true, actor: "admin" })}::json, '{}'::json, 'start', 0, now())
+        `;
+        await setInstance(inst.id, { status: "Creating", error: null });
+        await writeAuditEvent(inst.id, "studio_credentials_repair", "管理员修复 Studio 凭据", { task_id: taskId });
+        taskIds.push(taskId);
+      }
+      return json({ task_ids: taskIds, count: taskIds.length, queued });
+    }
+
+    if (/^\/api\/instances\/[^/]+\/studio-credential\/repair$/.test(path) && method === "POST") {
+      if (!(await requireAdmin(req))) return error("需要管理员权限", 403);
+      const id = path.split("/").slice(-3)[0];
+      const body = await req.json();
+      const rows = await sql`select * from pool_instances where id = ${id} and is_deleted = false limit 1`;
+      const inst: any = rows[0];
+      if (!inst) return error("实例不存在", 404);
+      const poolRows = inst.pool_id ? await sql`select config from pools where id = ${inst.pool_id} limit 1` : [];
+      if (poolConfig(poolRows[0]?.config).allow_user_studio === false) {
+        return error("当前资源池未开放 Studio 访问", 400);
+      }
+      const busy = await sql`
+        select id from tasks where target_id = ${inst.id} and kind = 'studio_credentials' and status in ('pending', 'running') limit 1
+      `;
+      if (busy[0]) return error("该实例已有 Studio 凭据任务在执行", 409);
+      const health = await studioCredentialHealth(inst.id);
+      if (health.status === "ready" && body.force !== true) {
+        return json({ instance_id: inst.id, count: 0, queued: 0, status: health.status });
+      }
+      if (inst.status === "InUse") {
+        const detail = { ...parseObject(inst.detail), studio_repair_on_return: true };
+        await setInstance(inst.id, { detail: JSON.stringify(detail) });
+        await writeAuditEvent(inst.id, "studio_credentials_repair_queued", "管理员登记归还时修复 Studio 凭据", {});
+        return json({ instance_id: inst.id, count: 0, queued: 1, status: health.status });
+      }
+      if (inst.status !== "InCold") return error(`实例当前状态为 ${inst.status}，暂不可修复 Studio 凭据`, 409);
+      const taskId = randomId();
+      const cloudMode = parseObject(inst.detail).cloud_mode || CLOUD_MODE;
+      await sql`
+        insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
+        values (${taskId}, 'studio_credentials', ${inst.mode}, ${inst.pool_id}, ${inst.id}, ${`修复 Studio 凭据 ${inst.app_name}`}, 'pending', 0, '等待 worker',
+                ${JSON.stringify({ instance_id: inst.id, cloud_mode: cloudMode, source: "repair", force: true, actor: "admin" })}::json, '{}'::json, 'start', 0, now())
+      `;
+      await setInstance(inst.id, { status: "Creating", error: null });
+      await writeAuditEvent(inst.id, "studio_credentials_repair", "管理员修复 Studio 凭据", { task_id: taskId });
+      return json({ instance_id: inst.id, task_id: taskId, count: 1, queued: 0, status: health.status });
+    }
+
     if ((path === "/api/v1/portal/instances/apply" || path === "/api/portal/instances/apply") && method === "POST") {
       const ctx = await authenticate(req);
       if (!hasScope(ctx, "instances:apply")) return error("API Token 缺少 instances:apply 权限", 403);
@@ -4979,73 +5221,110 @@ async function handler(req: Request): Promise<Response> {
       } catch (err) {
         return error(String(err));
       }
-      const active = await sql`
-        select * from pool_instances
-        where owner_user_id = ${ctx!.user.id} and is_deleted = false
-          and detail->>'bound_app_name' = ${appName}
-          and status in ('Creating', 'Available', 'InUse')
-        limit 1
-      `;
-      if (active[0]) return error("该应用已有运行中的实例，请先归还", 409);
-      const candidates = studioRequired
-        ? await sql`
+      const result: any = await withAppLock(ctx!.user.id, appName, async (tx: any) => {
+        const active = await tx`
           select * from pool_instances
-          where pool_id = ${pool.id} and is_deleted = false and status = 'InCold'
-            and coalesce(detail->>'reserved', 'false') != 'true'
-            and coalesce(detail->>'studio_rotation_pending', 'false') != 'true'
-            and owner_user_id is null
-            and exists (
-              select 1 from instance_credentials c
-              where c.instance_id = pool_instances.id and c.initialized = true
-            )
-          order by created_at asc limit 1
-        `
-        : await sql`
-          select * from pool_instances
-          where pool_id = ${pool.id} and is_deleted = false and status = 'InCold'
-            and coalesce(detail->>'reserved', 'false') != 'true'
-            and owner_user_id is null
-          order by created_at asc limit 1
+          where owner_user_id = ${ctx!.user.id} and is_deleted = false
+            and detail->>'bound_app_name' = ${appName}
+            and status in ('Creating', 'Available', 'InUse')
+          limit 1
         `;
-      const instance: any = candidates[0];
-      if (!instance) {
-        return error(
-          studioRequired
-            ? "该地域冷池暂无已初始化 Studio 凭据的可用实例，请联系管理员初始化 Studio 凭据"
-            : "该地域冷池暂无可用实例，请联系管理员预热",
-          409,
-        );
-      }
-      const studioGuard = await studioAllocationGuard(instance, pool);
-      if (studioGuard) return error(studioGuard, 409);
-      const initialNetwork = {
-        managed: true,
-        mode: selection.mode,
-        cidrs: selection.cidrs,
-        desired: selection.desired,
-        state: "pending",
-        last_applied_at: null,
-        last_verified_at: null,
-        last_error: "",
-        updated_by: ctx!.user.username,
-      };
-      const detail = { ...parseObject(instance.detail), bound_app_name: appName, network: initialNetwork };
-      await setInstance(instance.id, {
-        status: "InUse",
-        owner_user_id: ctx!.user.id,
-        bound_user: ctx!.user.username,
-        bound_app_id: instance.bound_app_id || `app-${randomToken(6)}`,
-        detail: JSON.stringify(detail),
-        error: null,
+        if (active[0]) return error("该应用已有运行中的实例，请先归还", 409);
+
+        const health = await studioCredentialHealthMap(tx);
+        const reserved = await tx`
+          select * from pool_instances
+          where pool_id = ${pool.id} and is_deleted = false and status = 'InCold'
+            and coalesce(detail->>'reserved', 'false') = 'true'
+            and coalesce(detail->>'reserved_app_name', '') = ${appName}
+            and (owner_user_id = ${ctx!.user.id} or detail->>'reserved_user_id' = ${ctx!.user.id})
+            and coalesce(detail->>'studio_rotation_pending', 'false') != 'true'
+          order by created_at asc limit 5
+        `;
+        let instance: any = null;
+        if (studioRequired) {
+          for (const candidate of reserved) {
+            if (health.get(candidate.id)?.status === "ready") {
+              instance = candidate;
+              break;
+            }
+          }
+          if (!instance && reserved.length) {
+            return error("该应用保留实例的 Studio 凭据未就绪，请联系管理员修复", 409);
+          }
+        } else {
+          instance = reserved[0] || null;
+        }
+        if (!instance) {
+          const candidates = await tx`
+            select * from pool_instances
+            where pool_id = ${pool.id} and is_deleted = false and status = 'InCold'
+              and coalesce(detail->>'reserved', 'false') != 'true'
+              and coalesce(detail->>'studio_rotation_pending', 'false') != 'true'
+              and owner_user_id is null
+            order by created_at asc limit 10
+          `;
+          for (const candidate of candidates) {
+            if (!studioRequired || health.get(candidate.id)?.status === "ready") {
+              instance = candidate;
+              break;
+            }
+          }
+        }
+        if (!instance) {
+          return error(
+            studioRequired
+              ? "该地域冷池暂无可用的 Studio 凭据就绪实例，请联系管理员修复 Studio 凭据"
+              : "该地域冷池暂无可用实例，请联系管理员预热",
+            409,
+          );
+        }
+
+        const initialNetwork = {
+          managed: true,
+          mode: selection.mode,
+          cidrs: selection.cidrs,
+          desired: selection.desired,
+          state: "pending",
+          last_applied_at: null,
+          last_verified_at: null,
+          last_error: "",
+          updated_by: ctx!.user.username,
+        };
+        const detail = { ...parseObject(instance.detail), bound_app_name: appName, network: initialNetwork };
+        delete detail.reserved;
+        delete detail.reserved_app_name;
+        delete detail.reserved_user_id;
+        const boundAppId = instance.bound_app_id || `app-${randomToken(6)}`;
+        const updated = await tx`
+          update pool_instances
+          set status = 'InUse', owner_user_id = ${ctx!.user.id}, bound_user = ${ctx!.user.username},
+              bound_app_id = ${boundAppId}, detail = ${detail}::json, error = null, updated_at = now()
+          where id = ${instance.id} and is_deleted = false and status = 'InCold'
+          returning id
+        `;
+        if (!updated[0]) return error("实例状态已变化，请重试", 409);
+        const taskId = randomId();
+        await tx`
+          insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
+          values (${taskId}, 'allocate', ${mode}, ${pool.id}, ${instance.id}, ${`分配 ${appName}`}, 'pending', 0, '等待 worker',
+                  ${JSON.stringify({ instance_id: instance.id, cloud_mode: detail.cloud_mode || CLOUD_MODE, app_name: appName, network: selection, actor: ctx!.user.username })}::json, '{}'::json, 'start', 0, now())
+        `;
+        return { taskId, instanceId: instance.id, boundAppId, selection };
       });
-      const taskId = randomId();
-      await sql`
-        insert into tasks (id, kind, mode, pool_id, target_id, title, status, progress, message, payload, result, step, attempts, created_at)
-        values (${taskId}, 'allocate', ${mode}, ${pool.id}, ${instance.id}, ${`分配 ${appName}`}, 'pending', 0, '等待 worker',
-                ${JSON.stringify({ instance_id: instance.id, cloud_mode: detail.cloud_mode || CLOUD_MODE, app_name: appName, network: selection, actor: ctx!.user.username })}::json, '{}'::json, 'start', 0, now())
-      `;
-      await writeAuditEvent(instance.id, "allocate", `分配给应用 ${appName}`, { app_name: appName, user: ctx!.user.username, network: selection });
-      return json({ task_id: taskId, instance_id: instance.id, app_name: appName, region_id: regionId, network: selection });
+      if (result instanceof Response) return result;
+      await writeAuditEvent(result.instanceId, "allocate", `分配给应用 ${appName}`, {
+        app_name: appName,
+        user: ctx!.user.username,
+        network: result.selection,
+      });
+      return json({
+        task_id: result.taskId,
+        instance_id: result.instanceId,
+        app_name: appName,
+        region_id: regionId,
+        network: result.selection,
+      });
     }
 
     if (/^\/api\/(v1\/)?portal\/instances\/[^/]+\/release$/.test(path) && method === "POST") {
@@ -5151,6 +5430,10 @@ async function handler(req: Request): Promise<Response> {
         return error(`单租 PG 标签无效：${String(err)}`, 400);
       }
       if (Number(nextConfig.target) > Number(nextConfig.max)) return error("目标空闲实例数不能大于最大实例数");
+      const totalRows = await sql`select count(*)::int as total from pool_instances where pool_id = ${id} and is_deleted = false`;
+      if (Number(nextConfig.max) < Number(totalRows[0]?.total || 0)) {
+        return error(`最大实例数不能小于当前实例数 ${totalRows[0]?.total || 0}`);
+      }
       await sql`
         update pools set
           name = ${body.name ?? pool.name},
@@ -5604,7 +5887,7 @@ async function handler(req: Request): Promise<Response> {
 
     if (path === "/api/billing/pool-cost" && method === "GET") {
       if (!(await requireAdmin(req))) return error("需要管理员权限", 403);
-      const month = url.searchParams.get("month") || new Date().toISOString().slice(0, 7);
+      const month = url.searchParams.get("month") || await currentBillingMonth();
       const regionId = url.searchParams.get("region_id") || "";
       const single = regionId
         ? await sql`select pg_instance_id, app_name, pool_id from pool_instances where is_deleted = false and region_id = ${regionId} and mode = 'single'`
@@ -5763,13 +6046,17 @@ async function handler(req: Request): Promise<Response> {
         `select * from pool_instances where ${conditions.join(" and ")} order by created_at desc limit $${params.length}`,
         params,
       );
-      const credentials = await sql`select instance_id, initialized from instance_credentials`;
-      const readyById = new Map(credentials.map((row: any) => [row.instance_id, !!row.initialized]));
+      const credentialHealth = await studioCredentialHealthMap();
       return json({
-        instances: rows.map((row: any) => ({
-          ...row,
-          studio_credentials_ready: readyById.get(row.id) === true,
-        })),
+        instances: rows.map((row: any) => {
+          const health = credentialHealth.get(row.id);
+          return {
+            ...row,
+            studio_credentials_ready: health?.status === "ready",
+            studio_credential_status: health?.status || "missing",
+            studio_credential_error: health?.error || "",
+          };
+        }),
       });
     }
 
@@ -5875,11 +6162,13 @@ async function handler(req: Request): Promise<Response> {
       const id = path.split("/").pop();
       const rows = await sql`select * from pool_instances where id = ${id} limit 1`;
       if (!rows[0]) return error("实例不存在", 404);
-      const credentials = await sql`select initialized from instance_credentials where instance_id = ${id} limit 1`;
+      const credentialHealth = await studioCredentialHealth(id);
       return json({
         ...rows[0],
         detail: parseObject(rows[0].detail),
-        studio_credentials_ready: !!credentials[0]?.initialized,
+        studio_credentials_ready: credentialHealth.status === "ready",
+        studio_credential_status: credentialHealth.status,
+        studio_credential_error: credentialHealth.error || "",
       });
     }
 
@@ -5945,7 +6234,7 @@ async function handler(req: Request): Promise<Response> {
       const network = networkView(detail);
       const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
       const access = await studioAccessPayload(adapter, inst, config);
-      return json({ ...access, network_state: network.state });
+      return json({ ...access, network_state: network.state, network_ready: !network.managed || network.state === "applied" });
     }
 
     if (/^\/api\/instances\/[^/]+\/access\/studio-password\/reveal$/.test(path) && method === "POST") {
@@ -5961,12 +6250,16 @@ async function handler(req: Request): Promise<Response> {
       if (config.allow_user_studio === false) return error("当前资源池未开放 Studio 访问", 403);
       const detail = parseObject(inst.detail);
       const network = networkView(detail);
-      if (network.managed && network.state !== "applied") return error(`网络白名单尚未就绪（${network.state}）`, 409);
+      if (network.managed && network.state !== "applied") return error(`网络白名单正在生效（${network.state}），请稍候再试`, 409);
       const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
       const access = await studioAccessPayload(adapter, inst, config);
-      if (!access.studio_available) return error("Studio 凭据尚未初始化", 409);
+      if (!access.studio_available) {
+        if (access.studio_credential_status === "unreadable") return error("Studio 凭据无法解密，请管理员修复", 409);
+        if (!access.studio_url) return error("Studio 公网入口暂不可用", 409);
+        return error("Studio 凭据尚未就绪", 409);
+      }
       const credential = await readStudioCredential(inst.id);
-      if (!credential?.initialized) return error("Studio 凭据尚未初始化", 409);
+      if (!credential) return error("Studio 凭据尚未就绪", 409);
       await writeAuditEvent(inst.id, "studio_password_reveal", "管理员查看 Studio 密码", {});
       return json({
         studio_url: access.studio_url,
@@ -6166,7 +6459,7 @@ async function handler(req: Request): Promise<Response> {
       const network = networkView(detail);
       const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
       const access = await studioAccessPayload(adapter, inst, config);
-      return json({ ...access, network_state: network.state });
+      return json({ ...access, network_state: network.state, network_ready: !network.managed || network.state === "applied" });
     }
 
     if (/^\/api\/(v1\/)?portal\/instances\/[^/]+\/access\/studio-password\/reveal$/.test(path) && method === "POST") {
@@ -6182,12 +6475,16 @@ async function handler(req: Request): Promise<Response> {
       if (config.allow_user_studio === false) return error("当前资源池未开放 Studio 访问", 403);
       const detail = parseObject(inst.detail);
       const network = networkView(detail);
-      if (network.managed && network.state !== "applied") return error(`网络白名单尚未就绪（${network.state}）`, 409);
+      if (network.managed && network.state !== "applied") return error(`网络白名单正在生效（${network.state}），请稍候再试`, 409);
       const adapter = cloudAdapter(detail.cloud_mode || CLOUD_MODE, inst.region_id);
       const access = await studioAccessPayload(adapter, inst, config);
-      if (!access.studio_available) return error("Studio 凭据尚未初始化", 409);
+      if (!access.studio_available) {
+        if (access.studio_credential_status === "unreadable") return error("Studio 凭据无法解密，请联系管理员修复", 409);
+        if (!access.studio_url) return error("Studio 公网入口暂不可用", 409);
+        return error("Studio 凭据尚未就绪", 409);
+      }
       const credential = await readStudioCredential(inst.id);
-      if (!credential?.initialized) return error("Studio 凭据尚未初始化", 409);
+      if (!credential) return error("Studio 凭据尚未就绪", 409);
       await writeAuditEvent(inst.id, "studio_password_reveal", "使用者查看 Studio 密码", { username: ctx!.user.username });
       return json({
         studio_url: access.studio_url,

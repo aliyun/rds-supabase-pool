@@ -159,9 +159,21 @@ Supabase 实例网络白名单由任务状态机维护：
   - Studio: `https://<domain>/`
   - Agent Runtime: `https://<domain>/agent-runtime`
 - Studio 凭据初始化、查看、归还处理都有审计；没有有效凭据的 InCold 实例禁止分配。
-- 池实例默认保留给同名应用，因此正常归还不会轮换仍有效的 Studio 密码；无凭据的存量实例会在归还时初始化一次。
+- Studio 凭据状态按能否用当前平台密钥解密判定：`missing`、`pending`、`unreadable`、`ready`。不可解密的凭据不能显示为就绪，也不能分配。
+- 管理员可以批量或按实例修复 Studio 凭据；InCold 会启动、重置密码、等待 Running、重新加密保存后停止，InUse 默认登记到归还时修复。
+- 无法解密的实例计入 `repairable`，不计入 `available`；存在 `repairable` 时自动补货暂停，避免继续创建新实例。
+- 池实例默认保留给同名应用，因此正常归还不会轮换仍有效的 Studio 密码；无凭据或凭据不可用的存量实例会在归还时修复一次。
+- 自动补货和手工预热使用池级 PostgreSQL advisory lock，把“统计总量/可用量、计算剩余额度、插入实例和任务”放在同一事务，保证 `max` 是硬上限。
 
-## 6. 认证与权限
+## 6. 时间与任务调度
+
+- 业务时间统一使用 `timestamptz`，数据库内部按 UTC 保存。
+- 旧版本的 `timestamp` 列会在首次启动时自动按数据库当前时区迁移为 `timestamptz`。
+- API 返回带 `Z` 的 UTC 时间，前端统一按浏览器本地时区展示。
+- 心跳、告警、监控时间也使用 `timestamptz`；不要混用无时区时间列。
+- 任务的 `next_run_at`、`locked_at`、`started_at`、`finished_at` 以及 PAT `expires_at` 都按同一时间语义处理。
+
+## 7. 认证与权限
 
 - 平台用户：`admin` / `user`
 - 浏览器使用 JWT Cookie
@@ -171,7 +183,7 @@ Supabase 实例网络白名单由任务状态机维护：
 - 使用者只能申请/归还，不能删除实例
 - 所有真实云写操作由管理员或任务 worker 执行
 
-## 7. 控制面配置
+## 8. 控制面配置
 
 `platform_config` 保存运行时配置：
 
@@ -182,7 +194,7 @@ Supabase 实例网络白名单由任务状态机维护：
 
 `pool_control_config` 在 `supabase_db` 保存当前控制库 URL（加密），支持控制库切换。
 
-## 8. 部署与环境
+## 9. 部署与环境
 
 - Edge Secrets：`CONTROL_DB_URL`、`PLATFORM_JWT_SECRET`、`WORKER_TOKEN`、云凭证、Supabase 应用密码等
 - `pool-api` 直连 PostgreSQL（`npm:postgres`）
@@ -190,7 +202,7 @@ Supabase 实例网络白名单由任务状态机维护：
 - 建议控制面实例与目标 PG/资源同地域、同 VPC，减少网络与延迟
 - 详细部署步骤见 [deployment.md](deployment.md)
 
-## 9. 设计取舍
+## 10. 设计取舍
 
 - **Edge 优先**：控制面不需要额外服务器；适合作为部署者侧轻量控制面。
 - **独立控制库**：与 `supabase_db` 解耦，升级、备份、切换更安全。

@@ -170,10 +170,10 @@ export function GlobalOverviewPage() {
                 </div>
 
                 <div className="mt-4 grid grid-cols-2 gap-2 text-[10px] sm:grid-cols-4">
-                  <Mini label="活跃租户" value={item.capacity?.current_active_tenants ?? 0} tone="acid" />
-                  <Mini label="注册租户" value={item.capacity?.current_total_tenants ?? 0} tone="cyan" />
-                  <Mini label="活跃上限" value={item.capacity?.estimated_max_active_tenants ?? 0} tone="slate" />
-                  <Mini label="注册上限" value={item.capacity?.estimated_max_total_tenants ?? 0} tone="violet" />
+                  <Mini label="RDS 活跃" value={item.capacity?.current_active_tenants ?? 0} tone="acid" />
+                  <Mini label="RDS 注册" value={item.capacity?.current_total_tenants ?? 0} tone="cyan" />
+                  <Mini label="RDS 活跃上限" value={item.capacity?.estimated_max_active_tenants ?? 0} tone="slate" />
+                  <Mini label="RDS 注册上限" value={item.capacity?.estimated_max_total_tenants ?? 0} tone="violet" />
                 </div>
 
                 {item.alerts.length ? (

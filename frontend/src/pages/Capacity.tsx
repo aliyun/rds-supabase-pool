@@ -119,11 +119,19 @@ export function CapacityPage() {
   const projected = useMemo(() => {
     if (!capacity) return null;
     const maxActive = capacity.estimated_max_active_tenants || 0;
+    const ratioMaxTotal = ratio > 0 ? Math.floor(maxActive / ratio) : 0;
+    const effectiveMaxTotal = stopMode === "force" ? ratioMaxTotal : maxActive;
     return {
-      maxTotal: ratio > 0 ? Math.floor(maxActive / ratio) : 0,
-      shrinkWarning: capacity.current_total_tenants > (ratio > 0 ? Math.floor(maxActive / ratio) : 0),
+      maxTotal: effectiveMaxTotal,
+      softMaxTotal: ratioMaxTotal,
+      shrinkWarning: capacity.current_total_tenants > effectiveMaxTotal,
     };
-  }, [capacity, ratio]);
+  }, [capacity, ratio, stopMode]);
+  const effectiveMaxTotal = capacity
+    ? stopMode === "force"
+      ? capacity.estimated_max_total_tenants
+      : capacity.estimated_max_active_tenants
+    : 0;
 
   const submit = async () => {
     if (!selectedId) return;
@@ -169,14 +177,18 @@ export function CapacityPage() {
 
   const aggregate = sharedPgs.reduce(
     (acc, item) => {
-      acc.active += item.capacity?.current_active_tenants ?? item.tenant_count ?? 0;
-      acc.total += item.capacity?.current_total_tenants ?? item.tenant_count ?? 0;
+      acc.inUse += item.in_use_count ?? 0;
+      acc.tenant += item.tenant_count ?? 0;
+      acc.rdsActive += item.capacity?.current_active_tenants ?? 0;
+      acc.rdsTotal += item.capacity?.current_total_tenants ?? 0;
       acc.maxActive += item.capacity?.estimated_max_active_tenants ?? 0;
       acc.maxTotal += item.capacity?.estimated_max_total_tenants ?? 0;
       return acc;
     },
-    { active: 0, total: 0, maxActive: 0, maxTotal: 0 },
+    { inUse: 0, tenant: 0, rdsActive: 0, rdsTotal: 0, maxActive: 0, maxTotal: 0 },
   );
+  const capacityKnown = sharedPgs.some((item) => !!item.capacity?.estimated_max_total_tenants);
+  const aggregateEffectiveMax = stopMode === "force" ? aggregate.maxTotal : aggregate.maxActive;
 
   return (
     <div className="space-y-4">
@@ -196,6 +208,18 @@ export function CapacityPage() {
         </div>
       ) : null}
 
+      {sharedPgs.length && stopMode === "normal" ? (
+        <div className="flex items-start gap-2 rounded-lg border border-amber/30 bg-amber/[0.06] px-3 py-2.5 text-[11px] leading-5 text-amber">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <div>
+            当前共享池停实例模式为<span className="font-medium">普通停</span>。普通停不会释放 RDS
+            活跃连接名额，activeRatio 的注册软上限不会生效；有效注册上限按活跃硬上限{" "}
+            <span className="mono">{formatNumber(aggregate.maxActive)}</span> 计算。如需使用软上限，需要将共享池改为
+            Force 停，并验证已有普通停实例是否会释放名额。
+          </div>
+        </div>
+      ) : null}
+
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Summary
           label="共享 PG"
@@ -203,21 +227,21 @@ export function CapacityPage() {
           sub={`${sharedPgs.filter((item) => item.enabled).length} 台启用`}
         />
         <Summary
-          label="当前活跃租户"
-          value={formatNumber(aggregate.active)}
-          sub={`上限 ${formatNumber(aggregate.maxActive)}`}
+          label="使用中租户"
+          value={formatNumber(aggregate.inUse)}
+          sub="池内 InUse 实例"
           tone="acid"
         />
         <Summary
-          label="当前注册租户"
-          value={formatNumber(aggregate.total)}
-          sub={`软上限 ${formatNumber(aggregate.maxTotal)}`}
+          label="注册租户"
+          value={formatNumber(aggregate.tenant)}
+          sub={`有效上限 ${formatNumber(aggregateEffectiveMax)} · 余量 ${formatNumber(Math.max(0, aggregateEffectiveMax - aggregate.tenant))}`}
           tone="cyan"
         />
         <Summary
-          label="调度余量"
-          value={formatNumber(Math.max(0, aggregate.maxTotal - aggregate.total))}
-          sub="按当前缓存容量估算"
+          label="RDS 活跃租户"
+          value={capacityKnown ? formatNumber(aggregate.rdsActive) : "—"}
+          sub={`RDS 注册 ${capacityKnown ? formatNumber(aggregate.rdsTotal) : "—"} · 硬上限 ${formatNumber(aggregate.maxActive)}`}
           tone="violet"
         />
       </div>
@@ -233,9 +257,9 @@ export function CapacityPage() {
               <tr>
                 <th className="px-4 py-2.5 font-normal">共享 PG</th>
                 <th className="px-3 py-2.5 font-normal">状态</th>
-                <th className="px-3 py-2.5 font-normal">租户 / 保留</th>
+                <th className="px-3 py-2.5 font-normal">使用中 / 注册</th>
                 <th className="px-3 py-2.5 font-normal">activeRatio</th>
-                <th className="px-3 py-2.5 font-normal">活跃 / 注册</th>
+                <th className="px-3 py-2.5 font-normal">RDS 活跃 / 注册</th>
                 <th className="px-3 py-2.5 font-normal">容量上限</th>
                 <th className="px-3 py-2.5 font-normal">最近检查</th>
               </tr>
@@ -276,6 +300,8 @@ export function CapacityPage() {
                       </div>
                     </td>
                     <td className="px-3 py-3 text-[11px] text-slate-400">
+                      <span className="mono text-acid">{pg.in_use_count ?? 0}</span>
+                      <span className="text-slate-600"> / </span>
                       <span className="mono">{pg.tenant_count}</span>
                       {pg.reserved_slots ? <span className="text-amber"> +{pg.reserved_slots} 保留</span> : null}
                     </td>
@@ -323,31 +349,31 @@ export function CapacityPage() {
               <div className="mt-5 flex flex-col items-center gap-6 sm:flex-row">
                 <RatioDial ratio={capacity.active_ratio} size={172} />
                 <div className="grid w-full flex-1 grid-cols-2 gap-3">
-                  <Metric label="当前活跃租户" value={formatNumber(capacity.current_active_tenants)} tone="acid" />
-                  <Metric label="当前注册租户" value={formatNumber(capacity.current_total_tenants)} tone="cyan" />
+                  <Metric label="RDS 活跃租户" value={formatNumber(capacity.current_active_tenants)} tone="acid" />
+                  <Metric label="RDS 注册租户" value={formatNumber(capacity.current_total_tenants)} tone="cyan" />
                   <Metric
-                    label="活跃租户硬上限"
+                    label="RDS 活跃上限"
                     value={formatNumber(capacity.estimated_max_active_tenants)}
                     tone="slate"
                   />
                   <Metric
-                    label="注册租户软上限"
-                    value={formatNumber(capacity.estimated_max_total_tenants)}
+                    label="有效注册上限"
+                    value={formatNumber(effectiveMaxTotal)}
                     tone="violet"
                   />
                 </div>
               </div>
               <div className="mt-5 space-y-2">
                 <div className="flex items-center justify-between text-[11px]">
-                  <span className="text-slate-500">注册租户 / 软上限</span>
+                  <span className="text-slate-500">RDS 注册租户 / 有效上限</span>
                   <span className="mono text-slate-300">
-                    {capacity.current_total_tenants} / {capacity.estimated_max_total_tenants}
+                    {capacity.current_total_tenants} / {effectiveMaxTotal}
                   </span>
                 </div>
                 <Progress
                   value={
-                    capacity.estimated_max_total_tenants
-                      ? (capacity.current_total_tenants / capacity.estimated_max_total_tenants) * 100
+                    effectiveMaxTotal
+                      ? (capacity.current_total_tenants / effectiveMaxTotal) * 100
                       : 0
                   }
                   tone="cyan"
@@ -416,7 +442,7 @@ export function CapacityPage() {
                 </Field>
                 <div className="rounded-lg border border-edge bg-white/[0.02] p-3 text-[11px]">
                   <div className="flex items-center justify-between">
-                    <span className="text-slate-500">调整后注册软上限</span>
+                    <span className="text-slate-500">调整后有效注册上限</span>
                     <span className="mono text-slate-200">{formatNumber(projected?.maxTotal ?? 0)}</span>
                   </div>
                   {projected?.shrinkWarning ? (
@@ -474,12 +500,13 @@ export function CapacityPage() {
               </div>
               <div className="mt-3 space-y-2 text-[11px] leading-6 text-slate-400">
                 <p>
-                  <span className="text-slate-200">当前活跃租户</span> 指持有连接配额、未被冻结的租户数，不是 Running
-                  实例数，也不是实时连接数。
+                  <span className="text-slate-200">使用中租户</span> 是池内 <span className="mono">InUse</span>{" "}
+                  实例数；<span className="text-slate-200">注册租户</span> 是控制面分配给该 PG 的未删除、非 Failed 租户数。
                 </p>
                 <p>
-                  普通保温停不会释放连接名额；只有 Force
-                  停或迁移冻结才会让租户从活跃中剔除。想让活跃租户数下降，需要对租户执行 Force 停。
+                  <span className="text-slate-200">RDS 活跃租户</span> 来自容量接口的{" "}
+                  <span className="mono">CurrentActiveTenants</span>，指持有连接配额、未被冻结的租户数，不是 Running
+                  实例数，也不是实时连接数。普通保温停不会释放连接名额；只有 Force 停或迁移冻结才会让租户从 RDS 活跃中剔除。
                 </p>
                 <div className="flex items-center justify-between rounded-lg border border-edge bg-white/[0.02] px-3 py-2">
                   <span className="text-slate-500">当前共享池停实例模式</span>

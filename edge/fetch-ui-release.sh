@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="${POOL_UI_RELEASE_TAG:-}"
 if [ -z "$TAG" ]; then
-  echo "DEPLOY_UI=release 需要设置 POOL_UI_RELEASE_TAG，例如 v0.1.3" >&2
+  echo "DEPLOY_UI=release 需要设置 POOL_UI_RELEASE_TAG，例如 v0.1.4" >&2
   exit 1
 fi
 case "$TAG" in

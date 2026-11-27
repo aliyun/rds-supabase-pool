@@ -12,7 +12,7 @@ import { Button, Badge, Card, EmptyState, Input, Select, Spinner, StatusBadge, T
 type ModeFilter = "all" | PoolMode;
 
 export function InstancesPage() {
-  const { instances, meta, regions, refreshAll, overview, loading } = useAppData();
+  const { instances, meta, regions, regionId, refreshAll, overview, loading } = useAppData();
   const { push } = useToast();
   const [searchParams, setSearchParams] = useSearchParams();
   const initialMode = (searchParams.get("mode") as ModeFilter) || "all";
@@ -89,8 +89,19 @@ export function InstancesPage() {
     }
   };
 
+  const scopedPools = useMemo(
+    () => (mode === "all" ? [overview?.pools?.single, overview?.pools?.shared] : [overview?.pools?.[mode]]).filter(Boolean),
+    [mode, overview],
+  );
+  const scopedCold = scopedPools.reduce((sum, pool) => sum + (pool?.cold ?? 0), 0);
+  const scopedInUse = scopedPools.reduce((sum, pool) => sum + (pool?.in_use ?? 0), 0);
+  const scopePoolId = mode === "all" ? null : overview?.pools?.[mode]?.id ?? null;
+  const scopeBody = mode === "all" ? { region_id: regionId } : { pool_id: scopePoolId || undefined };
+
+  const inScope = (instance: Instance) => mode === "all" || instance.mode === mode;
+
   const runtimeBackfillCandidates = instances.filter(
-    (instance) => instance.status === "InCold" && instance.detail?.agent_runtime?.enabled !== true,
+    (instance) => inScope(instance) && instance.status === "InCold" && instance.detail?.agent_runtime?.enabled !== true,
   ).length;
 
   const studioDisabledPools = useMemo(
@@ -105,7 +116,8 @@ export function InstancesPage() {
 
   const studioBackfillCandidates = instances.filter(
     (instance) =>
-      instance.status === "InCold"
+      inScope(instance)
+      && ["InCold", "InUse"].includes(instance.status)
       && !instance.studio_credentials_ready
       && !studioDisabledPools.has(instance.pool_id || ""),
   ).length;
@@ -113,8 +125,8 @@ export function InstancesPage() {
   const runStudioBackfill = async () => {
     setStudioBackfillLoading(true);
     try {
-      const result = await api.backfillStudioCredentials();
-      push("success", `已提交 ${result.count} 个 Studio 凭据初始化任务`);
+      const result = await api.repairStudioCredentials(scopeBody);
+      push("success", `已提交 ${result.count} 个 Studio 凭据修复任务，${result.queued} 个将在归还时修复`);
       await refreshAll();
     } catch (error) {
       push("error", error instanceof Error ? error.message : String(error));
@@ -126,7 +138,7 @@ export function InstancesPage() {
   const runAgentRuntimeBackfill = async () => {
     setRuntimeBackfillLoading(true);
     try {
-      const result = await api.backfillAgentRuntime();
+      const result = await api.backfillAgentRuntime(scopeBody);
       push("success", `已提交 ${result.count} 个 Agent Runtime 启用任务`);
       await refreshAll();
     } catch (error) {
@@ -153,11 +165,11 @@ export function InstancesPage() {
             <div className="flex flex-wrap items-center gap-2">
               <div className="hidden items-center gap-2 rounded-lg border border-edge bg-white/[0.02] px-2.5 py-1.5 text-[10px] text-slate-500 sm:flex">
                 <span>
-                  冷池 <span className="mono text-sky-300">{overview?.pools?.single?.cold ?? 0}</span>
+                  冷池 <span className="mono text-sky-300">{scopedCold}</span>
                 </span>
                 <span className="h-3 w-px bg-edge" />
                 <span>
-                  使用中 <span className="mono text-acid">{overview?.pools?.single?.in_use ?? 0}</span>
+                  使用中 <span className="mono text-acid">{scopedInUse}</span>
                 </span>
               </div>
               <Button
@@ -184,7 +196,7 @@ export function InstancesPage() {
                 disabled={studioBackfillCandidates === 0}
                 onClick={() => void runStudioBackfill()}
               >
-                初始化 Studio 凭据{studioBackfillCandidates ? ` (${studioBackfillCandidates})` : ""}
+                修复 Studio 凭据{studioBackfillCandidates ? ` (${studioBackfillCandidates})` : ""}
               </Button>
               <Button
                 variant="primary"

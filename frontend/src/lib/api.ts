@@ -241,6 +241,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  repairStudioCredentials: (body: { pool_id?: string; region_id?: string; limit?: number; force?: boolean } = {}) =>
+    request<{ task_ids: string[]; count: number; queued: number }>("/instances/repair-studio-credentials", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  repairStudioCredential: (id: string, force = false) =>
+    request<{ instance_id: string; task_id?: string; count: number; queued: number; status: string }>(
+      `/instances/${id}/studio-credential/repair`,
+      { method: "POST", body: JSON.stringify({ force }) },
+    ),
   pgTags: (id: string) =>
     request<{ pg_instance_id: string; tags: PgTag[] }>(`/instances/${id}/pg-tags`),
   updatePgTags: (id: string, tags: PgTag[]) =>

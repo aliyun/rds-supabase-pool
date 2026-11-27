@@ -83,6 +83,23 @@ export function PortalApp() {
   const regions = data?.regions ?? [];
   const instances = data?.instances ?? [];
   const availableTotal = useMemo(() => regions.reduce((sum, item) => sum + item.available, 0), [regions]);
+  const activeAppNames = useMemo(
+    () => new Set(
+      instances
+        .filter((item) => ["Creating", "Available", "InUse"].includes(item.status))
+        .map((item) => item.app_name),
+    ),
+    [instances],
+  );
+  const reservedAppCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const item of instances) {
+      if (item.status !== "InCold" || !item.reserved) continue;
+      const appName = item.reserved_app_name || item.app_name;
+      counts.set(appName, (counts.get(appName) || 0) + 1);
+    }
+    return counts;
+  }, [instances]);
 
   const openApply = (region?: PortalRegion, mode?: "single" | "shared") => {
     const targetRegion = region || regions.find((item) => item.available > 0) || regions[0] || null;
@@ -284,7 +301,15 @@ export function PortalApp() {
                   </tr>
                 </thead>
                 <tbody>
-                  {instances.map((instance) => (
+                  {instances.map((instance) => {
+                    const reservedApp = instance.reserved_app_name || instance.app_name;
+                    const hasActiveDuplicate = instance.status === "InCold"
+                      && !!instance.reserved
+                      && activeAppNames.has(reservedApp);
+                    const hasReservedDuplicate = instance.status === "InCold"
+                      && !!instance.reserved
+                      && (reservedAppCounts.get(reservedApp) || 0) > 1;
+                    return (
                     <tr key={instance.id} className="border-t border-edge/60">
                       <td className="px-4 py-3">
                         <div className="text-[12px] text-slate-200">{instance.app_name}</div>
@@ -301,6 +326,11 @@ export function PortalApp() {
                             <Badge className="border-amber/25 bg-amber/[0.07] text-amber">
                               保留给 {instance.reserved_app_name || instance.app_name}
                             </Badge>
+                          ) : null}
+                          {hasActiveDuplicate ? (
+                            <Badge className="border-rose/25 bg-rose/[0.07] text-rose">已有使用中实例</Badge>
+                          ) : hasReservedDuplicate ? (
+                            <Badge className="border-rose/25 bg-rose/[0.07] text-rose">重复保留实例</Badge>
                           ) : null}
                         </div>
                         {instance.error ? (
@@ -348,7 +378,7 @@ export function PortalApp() {
                               归还
                             </Button>
                           ) : null}
-                          {instance.status === "InCold" && instance.reserved ? (
+                          {instance.status === "InCold" && instance.reserved && !hasActiveDuplicate && !hasReservedDuplicate ? (
                             <Button
                               size="sm"
                               variant="ghost"
@@ -361,13 +391,19 @@ export function PortalApp() {
                           {instance.status === "InCold" && !instance.reserved ? (
                             <span className="text-[10px] text-slate-600">等待管理员分配</span>
                           ) : null}
+                          {instance.status === "InCold" && instance.reserved && (hasActiveDuplicate || hasReservedDuplicate) ? (
+                            <span className="text-[10px] text-rose">
+                              {hasActiveDuplicate ? "请先归还当前实例" : "请联系管理员清理"}
+                            </span>
+                          ) : null}
                           {instance.status === "Failed" ? (
                             <span className="text-[10px] text-rose">请联系管理员</span>
                           ) : null}
                         </div>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1226,6 +1262,7 @@ function AccessModal({ instance, onClose }: { instance: PortalInstance; onClose:
   const [secret, setSecret] = useState<{ username: string; password: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [revealing, setRevealing] = useState(false);
+  const [revealError, setRevealError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -1246,6 +1283,29 @@ function AccessModal({ instance, onClose }: { instance: PortalInstance; onClose:
     };
   }, [instance.id]);
 
+  const networkReady = access?.network_ready === true
+    || (access?.network_ready === undefined && access?.network_state === "applied");
+
+  useEffect(() => {
+    if (!access || networkReady) return;
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const data = await api.portalAccess(instance.id);
+        if (!cancelled) {
+          setAccess(data);
+          if (data.network_ready) setRevealError(null);
+        }
+      } catch {
+        // keep the current status visible; the user can retry later
+      }
+    }, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [instance.id, access, networkReady]);
+
   const copy = async (label: string, value: string) => {
     try {
       await navigator.clipboard.writeText(value);
@@ -1256,12 +1316,17 @@ function AccessModal({ instance, onClose }: { instance: PortalInstance; onClose:
   };
 
   const reveal = async () => {
+    if (!networkReady) {
+      setRevealError("网络白名单正在生效，生效后即可查看密码。");
+      return;
+    }
     setRevealing(true);
+    setRevealError(null);
     try {
       const data = await api.revealStudio(instance.id);
       setSecret({ username: data.studio_username, password: data.studio_password });
     } catch (err) {
-      push("error", err instanceof Error ? err.message : String(err));
+      setRevealError(err instanceof Error ? err.message : String(err));
     } finally {
       setRevealing(false);
     }
@@ -1286,6 +1351,17 @@ function AccessModal({ instance, onClose }: { instance: PortalInstance; onClose:
             这些入口只对当前实例使用者开放，请勿分享给其他应用。
           </div>
 
+          {access && !networkReady ? (
+            <div className="flex items-start gap-2 rounded-lg border border-amber/30 bg-amber/[0.06] px-3 py-2.5 text-[11px] leading-5 text-amber">
+              <TriangleAlert size={14} className="mt-0.5 shrink-0" />
+              <span>
+                {access.network_state === "error"
+                  ? "网络白名单配置失败，请联系管理员处理。"
+                  : `网络白名单正在生效（${access.network_state || "pending"}），生效后即可查看 Studio 密码；此窗口会自动刷新。`}
+              </span>
+            </div>
+          ) : null}
+
           <div className="rounded-lg border border-edge bg-white/[0.02] p-3">
             <div className="flex items-center justify-between gap-2">
               <div>
@@ -1299,8 +1375,14 @@ function AccessModal({ instance, onClose }: { instance: PortalInstance; onClose:
             <div className="mono mt-2 break-all text-[10px] text-slate-400">{access?.studio_url || "暂不可用"}</div>
             {access?.studio_available ? (
               <div className="mt-2 flex flex-wrap items-center gap-2">
-                <Button size="sm" variant="secondary" loading={revealing} onClick={() => void reveal()}>
-                  显示密码
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  loading={revealing}
+                  disabled={!networkReady}
+                  onClick={() => void reveal()}
+                >
+                  {networkReady ? "显示密码" : "等待网络就绪"}
                 </Button>
                 {secret ? (
                   <>
@@ -1310,10 +1392,15 @@ function AccessModal({ instance, onClose }: { instance: PortalInstance; onClose:
                     </Button>
                   </>
                 ) : null}
+                {revealError ? <div className="w-full text-[10px] text-rose">{revealError}</div> : null}
               </div>
             ) : (
               <div className="mt-2 text-[10px] text-amber">
-                {access?.studio_url ? "Studio 凭据尚未初始化，请联系管理员。" : "当前资源池未开放 Studio 访问。"}
+                {access?.studio_credential_status === "unreadable"
+                  ? "Studio 凭据不可用，请联系管理员修复。"
+                  : access?.studio_url
+                    ? "Studio 凭据尚未就绪，请联系管理员。"
+                    : "当前资源池未开放 Studio 访问。"}
               </div>
             )}
           </div>

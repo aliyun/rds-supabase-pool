@@ -19,7 +19,7 @@ The deployment script does not create the control-plane instance.
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.3"
+export POOL_UI_RELEASE_TAG="v0.1.4"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<strong-password>"
@@ -51,7 +51,7 @@ performs a health check.
 ### UI deployment modes
 
 Customer deployments use a prebuilt GitHub Release artifact and do not require
-Node/npm. The corresponding release must contain `pool-ui-v0.1.3.ts` and its
+Node/npm. The corresponding release must contain `pool-ui-v0.1.4.ts` and its
 `.sha256`; the script verifies the checksum and aborts on mismatch.
 
 For source development or release building, use `DEPLOY_UI=source` (requires
@@ -64,10 +64,10 @@ DEPLOY_UI=source ./edge/bootstrap.sh
 To update only the API, use `DEPLOY_UI=0`. Build release assets with:
 
 ```bash
-./scripts/build-ui-release.sh v0.1.3
+./scripts/build-ui-release.sh v0.1.4
 ```
 
-Then upload `edge/.build/release/pool-ui-v0.1.3.ts` and `.sha256` to the
+Then upload `edge/.build/release/pool-ui-v0.1.4.ts` and `.sha256` to the
 corresponding GitHub Release. `POOL_UI_RELEASE_REPO` and
 `POOL_UI_RELEASE_URL` can override the default download location.
 
@@ -85,7 +85,7 @@ corresponding GitHub Release. `POOL_UI_RELEASE_REPO` and
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 ./edge/upgrade.sh
 ```
 
@@ -96,7 +96,7 @@ need to be invoked by customers.
 
 To keep the UI settings saved in `.bootstrap.env`, you can also run
 `./edge/upgrade.sh` directly, or change `POOL_UI_RELEASE_TAG` in that file to
-`v0.1.3`.
+`v0.1.4`.
 
 ### 5.2 Without edge/.bootstrap.env
 
@@ -105,7 +105,7 @@ and AK/SK:
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -123,7 +123,7 @@ instance lookup:
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 SUPABASE_URL="https://<domain>" \
 SUPABASE_SERVICE_KEY="<service-key>" \
 WORKER_TOKEN="<existing worker token>" \
@@ -141,7 +141,7 @@ re-hooks the scheduler:
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \

@@ -96,6 +96,7 @@ export function InstanceDrawer({
   const [liveError, setLiveError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [studioRepairLoading, setStudioRepairLoading] = useState(false);
   const [allocateOpen, setAllocateOpen] = useState(false);
   const [releaseOpen, setReleaseOpen] = useState(false);
   const [confirmAction, setConfirmAction] = useState<"stop" | "restart" | null>(null);
@@ -199,6 +200,28 @@ export function InstanceDrawer({
     }
   };
 
+  const repairStudioCredential = async () => {
+    if (!instance) return;
+    setStudioRepairLoading(true);
+    try {
+      const result = await api.repairStudioCredential(instance.id);
+      push(
+        "success",
+        result.count
+          ? "Studio 凭据修复任务已提交"
+          : result.queued
+            ? "已登记，将在实例归还时修复 Studio 凭据"
+            : "Studio 凭据已就绪，无需修复",
+      );
+      await refreshAll();
+      await load();
+    } catch (error) {
+      push("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setStudioRepairLoading(false);
+    }
+  };
+
   const saveNetwork = async () => {
     if (!instance) return;
     setSavingNetwork(true);
@@ -271,7 +294,16 @@ export function InstanceDrawer({
       ["Supabase", instance.supabase_instance_id || "—"],
       ["底层 PG", instance.pg_instance_id || "—"],
       ["PG 标签", (instance.pg_tags || []).map((tag) => `${tag.key}${tag.value ? `=${tag.value}` : ""}`).join(" · ") || "—"],
-      ["Studio 凭据", instance.studio_credentials_ready ? "已初始化" : "未初始化"],
+      [
+        "Studio 凭据",
+        instance.studio_credential_status === "unreadable"
+          ? "不可解密，需修复"
+          : instance.studio_credential_status === "pending"
+            ? "待重置"
+            : instance.studio_credentials_ready
+              ? "已就绪"
+              : "未初始化",
+      ],
       ["规格", instance.instance_class || "—"],
       ["地域 / 可用区", `${instance.region_id} / ${instance.detail?.cloud?.zone_id || "—"}`],
       ["VPC / VSwitch", `${instance.vpc_id || "—"} / ${instance.vswitch_id || "—"}`],
@@ -396,6 +428,17 @@ export function InstanceDrawer({
               >
                 同步状态
               </Button>
+              {["InCold", "InUse"].includes(instance.status) && !instance.studio_credentials_ready ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  icon={<KeyRound size={13} />}
+                  loading={studioRepairLoading}
+                  onClick={() => void repairStudioCredential()}
+                >
+                  {instance.status === "InUse" ? "归还时修复凭据" : "修复 Studio 凭据"}
+                </Button>
+              ) : null}
               <Button size="sm" variant="danger" icon={<Trash2 size={13} />} onClick={() => setReleaseOpen(true)}>
                 保留 / 删除
               </Button>

@@ -59,7 +59,7 @@ flowchart LR
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.3"
+export POOL_UI_RELEASE_TAG="v0.1.4"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<8~32 位，至少包含大写/小写/数字/特殊字符中的三类>"
@@ -75,7 +75,7 @@ export DINGTALK_SECRET="SEC..."   # required only for a signed robot
 ./edge/bootstrap.sh
 ```
 
-> Release 模式需要对应 GitHub Release 已上传 `pool-ui-v0.1.3.ts` 和 `.sha256`。
+> Release 模式需要对应 GitHub Release 已上传 `pool-ui-v0.1.4.ts` 和 `.sha256`。
 > 开发或尚未发布 Release 时，使用源码构建：`DEPLOY_UI=source ./edge/bootstrap.sh`（需要 Node/npm）。
 > 只更新 API：`DEPLOY_UI=0 ./edge/bootstrap.sh`。
 
@@ -120,7 +120,7 @@ export CLOUD_MODE="real"
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 ./edge/upgrade.sh
 ```
 
@@ -130,7 +130,7 @@ POOL_UI_RELEASE_TAG="v0.1.3" \
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -143,7 +143,7 @@ WORKER_TOKEN="<原 worker token>" \
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \

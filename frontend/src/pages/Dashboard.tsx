@@ -221,10 +221,10 @@ export function DashboardPage() {
             <div className="mt-3 flex items-center gap-4">
               <RatioDial ratio={capacity.active_ratio ?? 0.5} size={124} />
               <div className="flex-1 space-y-2 text-[11px]">
-                <Row label="活跃租户" value={capacity.current_active_tenants ?? 0} />
-                <Row label="注册租户" value={capacity.current_total_tenants ?? 0} />
-                <Row label="活跃上限" value={capacity.estimated_max_active_tenants ?? 0} />
-                <Row label="注册上限" value={capacity.estimated_max_total_tenants ?? 0} />
+                <Row label="RDS 活跃" value={capacity.current_active_tenants ?? 0} />
+                <Row label="RDS 注册" value={capacity.current_total_tenants ?? 0} />
+                <Row label="RDS 活跃上限" value={capacity.estimated_max_active_tenants ?? 0} />
+                <Row label="RDS 注册上限" value={capacity.estimated_max_total_tenants ?? 0} />
                 <Link to="/capacity" className="inline-flex items-center gap-1 pt-1 text-cyan-400 hover:text-cyan-300">
                   调整容量 <ArrowRight size={12} />
                 </Link>

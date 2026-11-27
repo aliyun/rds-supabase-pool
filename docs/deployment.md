@@ -174,7 +174,7 @@ export AUTO_WHITELIST=false
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.3"
+export POOL_UI_RELEASE_TAG="v0.1.4"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<8~32 位，至少含大写/小写/数字/特殊字符中的三类>"
@@ -194,7 +194,7 @@ export DINGTALK_SECRET="SEC..."   # 仅钉钉机器人使用“加签”时需�
 
 ### UI 部署模式
 
-客户部署默认使用 Release 产物，无需安装 Node/npm；前提是对应 GitHub Release 已上传 `pool-ui-v0.1.3.ts` 和 `.sha256`。脚本会下载并校验 SHA256，校验失败会中止。
+客户部署默认使用 Release 产物，无需安装 Node/npm；前提是对应 GitHub Release 已上传 `pool-ui-v0.1.4.ts` 和 `.sha256`。脚本会下载并校验 SHA256，校验失败会中止。
 
 源码开发或发版时使用 `DEPLOY_UI=source`（脚本默认值，需要 Node 20.19+）：
 
@@ -211,10 +211,10 @@ DEPLOY_UI=0 ./edge/bootstrap.sh
 构建 Release 产物：
 
 ```bash
-./scripts/build-ui-release.sh v0.1.3
+./scripts/build-ui-release.sh v0.1.4
 ```
 
-生成 `edge/.build/release/pool-ui-v0.1.3.ts` 和 `.sha256`，上传到对应 GitHub Release 即可。可用 `POOL_UI_RELEASE_REPO`、`POOL_UI_RELEASE_URL` 覆盖默认下载地址。
+生成 `edge/.build/release/pool-ui-v0.1.4.ts` 和 `.sha256`，上传到对应 GitHub Release 即可。可用 `POOL_UI_RELEASE_REPO`、`POOL_UI_RELEASE_URL` 覆盖默认下载地址。
 
 脚本会调用 RdsAi/RDS API 自动解析：
 
@@ -320,13 +320,13 @@ https://<domain>/functions/v1/pool-api
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 ./edge/upgrade.sh
 ```
 
 `upgrade.sh` 会自动读取部署坐标，更新 `pool-api`、`pool-ui`、`pool-notifier`，重挂 worker/watchdog，并执行健康检查。`deploy.sh` 只作为内部部署实现，客户不需要直接调用。
 
-如果只想沿用 `.bootstrap.env` 中保存的 UI 配置，也可以直接执行 `./edge/upgrade.sh`。也可以直接把 `.bootstrap.env` 中的 `POOL_UI_RELEASE_TAG` 改成 `v0.1.3`。
+如果只想沿用 `.bootstrap.env` 中保存的 UI 配置，也可以直接执行 `./edge/upgrade.sh`。也可以直接把 `.bootstrap.env` 中的 `POOL_UI_RELEASE_TAG` 改成 `v0.1.4`。
 
 ### 9.2 没有 .bootstrap.env
 
@@ -334,7 +334,7 @@ POOL_UI_RELEASE_TAG="v0.1.3" \
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -349,7 +349,7 @@ WORKER_TOKEN="<原 worker token>" \
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 SUPABASE_URL="https://<domain>" \
 SUPABASE_SERVICE_KEY="<service-key>" \
 WORKER_TOKEN="<原 worker token>" \
@@ -364,7 +364,7 @@ WORKER_TOKEN="<原 worker token>" \
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \

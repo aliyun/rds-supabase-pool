@@ -562,8 +562,9 @@ function PoolTile({ pool, onEdit }: { pool: RegionPool; onEdit: () => void }) {
         </div>
         <div className="mt-1 text-[10px] text-slate-600">
           可用 <span className="mono text-slate-400">{pool.available}</span> / 目标{" "}
-          <span className="mono text-slate-400">{pool.target}</span>，冷池{" "}
-          <span className="mono text-slate-400">{pool.cold}</span>，保留{" "}
+          <span className="mono text-slate-400">{pool.target}</span>，待修复{" "}
+          <span className={cx("mono", pool.repairable ? "text-amber" : "text-slate-400")}>{pool.repairable}</span>
+          ，冷池 <span className="mono text-slate-400">{pool.cold}</span>，保留{" "}
           <span className="mono text-slate-400">{pool.reserved}</span>
         </div>
       </div>

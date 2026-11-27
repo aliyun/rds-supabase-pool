@@ -60,9 +60,12 @@ export interface InstanceAccess {
   studio_url: string;
   studio_username: string;
   studio_available: boolean;
+  studio_credential_status?: "missing" | "pending" | "unreadable" | "ready";
+  studio_error?: string;
   agent_runtime_url: string;
   agent_runtime_available: boolean;
   network_state?: string;
+  network_ready?: boolean;
 }
 
 export interface StudioSecret {
@@ -180,6 +183,7 @@ export interface PoolSummary {
   cold: number;
   reserved: number;
   available: number;
+  repairable: number;
   in_use: number;
   creating: number;
   failed: number;
@@ -223,6 +227,7 @@ export interface SharedPg {
   weight: number;
   reserved_slots: number;
   tenant_count: number;
+  in_use_count: number;
   tags: PgTag[];
   active_tenant_count?: number;
   capacity: Capacity;
@@ -445,6 +450,8 @@ export interface Instance {
   pg_instance_id: string | null;
   pg_tags: PgTag[];
   studio_credentials_ready?: boolean;
+  studio_credential_status?: "missing" | "pending" | "unreadable" | "ready";
+  studio_credential_error?: string;
   supabase_instance_id: string | null;
   instance_class: string;
   cloud_status: string | null;

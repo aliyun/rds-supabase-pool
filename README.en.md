@@ -54,7 +54,7 @@ Prerequisites:
 
 ```bash
 export DEPLOY_UI="release"
-export POOL_UI_RELEASE_TAG="v0.1.3"
+export POOL_UI_RELEASE_TAG="v0.1.4"
 
 export INSTANCE_NAME="ra-supabase-xxxxxxxx"
 export POOL_ADMIN_PASSWORD="<strong-password>"
@@ -70,7 +70,7 @@ export DINGTALK_SECRET="SEC..."   # required only for a signed robot
 ./edge/bootstrap.sh
 ```
 
-> Release mode requires `pool-ui-v0.1.3.ts` and its `.sha256` to be uploaded to the corresponding GitHub Release.
+> Release mode requires `pool-ui-v0.1.4.ts` and its `.sha256` to be uploaded to the corresponding GitHub Release.
 > For development or before a release exists, use `DEPLOY_UI=source ./edge/bootstrap.sh` (requires Node/npm).
 > To update the API only, use `DEPLOY_UI=0 ./edge/bootstrap.sh`.
 
@@ -97,7 +97,7 @@ There is no need to rerun `bootstrap.sh` on an existing instance. With `edge/.bo
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 ./edge/upgrade.sh
 ```
 
@@ -107,7 +107,7 @@ Without `.bootstrap.env`, provide the instance name, region and AK/SK:
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
@@ -120,7 +120,7 @@ If the existing `WORKER_TOKEN` is unavailable, there is no need to recover it. R
 
 ```bash
 DEPLOY_UI="release" \
-POOL_UI_RELEASE_TAG="v0.1.3" \
+POOL_UI_RELEASE_TAG="v0.1.4" \
 INSTANCE_NAME="ra-xxxxxxxx" \
 REGION="cn-shanghai" \
 ALIBABA_CLOUD_ACCESS_KEY_ID="<AK>" \
